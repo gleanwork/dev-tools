@@ -96,6 +96,46 @@ If interactive (`-i`): `Ready for File 1? (yes / skip to [file] / reorder / done
 
 ---
 
+## Review Pass Order (default)
+
+Use a two-pass review so output is coherent for humans and easy to act on:
+
+1. **Fast code pass first (silent):**
+   - Find concrete, line-level issues (correctness, race, missing guard, test gaps, bad naming, etc.)
+   - Draft concise inline comments for those issues
+   - Keep a shortlist of "quick fixes" that can be knocked off immediately
+2. **Deep PR pass second (silent):**
+   - Explain the change in simple English (what changed and why)
+   - Analyze edge cases, downsides, adverse effects, and hidden assumptions
+   - Evaluate whether this is the right/sufficient change, and suggest better alternatives only when they are clearly better
+3. **Present results in this order:**
+   - `Simple-English PR understanding` (2-4 lines)
+   - `Quick code-level findings` (actionable, comment-ready)
+   - `Deep risks / sufficiency / alternatives` (the "meat")
+
+This keeps momentum (quick issues first) without skipping strategic review.
+
+### Edge-case and downside checklist (required in deep pass)
+
+- Failure modes: nil/empty inputs, retries, timeouts, partial failures, rollback paths
+- Concurrency/ordering: races, re-entrancy, out-of-order events, duplicated events
+- Scale/resource costs: memory, latency, fanout, logging/alert noise
+- Behavioral regressions: changed defaults, compatibility, migration impact
+- Product/design sufficiency: does this solve the root problem or just the symptom?
+- Better options: simpler implementation, safer guardrails, or tighter scope
+- Immediate simplifier: is there one small, low-risk change that clearly improves this PR without adding complexity?
+
+If the PR is tiny and purely local, keep this brief but do not skip it.
+
+### Tone and recommendation guardrails
+
+- Do not mansplain. Keep language direct, respectful, and concise.
+- Do not invent alternatives "for completeness." If current approach is sound, say so.
+- Only propose an alternative when there is a concrete benefit (simpler, safer, clearer, or less risky).
+- If no better option is clear, explicitly write: `No better alternative identified.`
+
+---
+
 ## Interactive Mode
 
 For each file:
@@ -145,7 +185,18 @@ Ready for next file? (yes / questions? / done)
 
 **Always pause.** User can ask questions, go back, or continue.
 
-### 5. Interactive Comment Posting (someone else's PR only)
+### 5. End-of-PR Deep Analysis (required before final wrap-up)
+
+After file-level issues are surfaced, provide a short section in simple English:
+
+- What this PR is trying to accomplish
+- Key edge cases and downsides
+- Why this might be insufficient or not the best approach
+- A better alternative, if one is clear
+
+Keep this focused; avoid repeating every line-level finding.
+
+### 6. Interactive Comment Posting (someone else's PR only)
 
 After each file, if issues were found, show each finding with its category, then the **draft comment** underneath. The draft is what actually gets posted — it must be natural, concise human language with no emoji tags or category prefixes:
 
@@ -174,6 +225,9 @@ Show findings categorized with emoji tags for the user's triage. Each finding al
 ```
 ## Review: [PR title]
 
+### Simple-English PR Understanding
+[2-4 lines: what this PR does and why, in plain English]
+
 ### 🔴 Must-fix
 | # | File:Line | Issue | Draft comment |
 |---|-----------|-------|---------------|
@@ -191,7 +245,22 @@ Show findings categorized with emoji tags for the user's triage. Each finding al
 - `test_handler.py`
 ```
 
-If **no issues found**, say so and stop.
+If **no code-level issues found**, note that in place of the 🔴/🟡 tables and proceed to the Deep Analysis section below.
+
+### Required Deep Analysis Section (after categorized findings)
+
+Always include this section, even when findings are mostly nits:
+
+```
+### Deep Analysis (Simple English)
+- **What changed**: [2-4 lines plain English]
+- **Edge cases & downsides**: [bullets]
+- **Why this may be insufficient**: [bullet(s), or "none found"]
+- **Better framing / alternative (only if clearly better)**: [bullet(s), or "No better alternative identified."]
+- **Simple immediate improvement**: [one small change, or "none found"]
+```
+
+If there are no meaningful deep concerns, state that explicitly instead of skipping the section.
 
 ### After presenting findings
 
