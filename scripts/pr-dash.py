@@ -394,24 +394,7 @@ def fetch_review_requests() -> tuple[list[dict], bool]:
 
     results = []
     for pr in pending_prs:
-        check_runs = []
-        seen_names: set[str] = set()
-        for ctx in pr.get('statusCheckRollup', []) or []:
-            if not ctx or ctx.get('__typename') != 'CheckRun':
-                continue
-            name = ctx.get('name', '')
-            if name in seen_names:
-                continue
-            seen_names.add(name)
-            check_runs.append(
-                {
-                    'name': name,
-                    'status': (ctx.get('status') or '').lower(),
-                    'conclusion': (ctx.get('conclusion') or '').lower(),
-                    'html_url': ctx.get('detailsUrl', ''),
-                }
-            )
-        check_runs.sort(key=lambda x: x['name'])
+        check_runs = parse_status_check_rollup(pr.get('statusCheckRollup'))
         ci_symbol, ci_class, ci_url = get_ci_status_summary(check_runs)
 
         author = pr.get('author', {})
@@ -527,24 +510,7 @@ def _parse_pr(pr: dict, current_user: str) -> dict | None:
     pending_set = set(pending_reviewers)
     commented_reviewers = [u for u in all_reviewers if u not in approvers_set and u not in pending_set]
 
-    check_runs = []
-    seen_names: set[str] = set()
-    for ctx in pr.get('statusCheckRollup', []) or []:
-        if not ctx or ctx.get('__typename') != 'CheckRun':
-            continue
-        name = ctx.get('name', '')
-        if name in seen_names:
-            continue
-        seen_names.add(name)
-        check_runs.append(
-            {
-                'name': name,
-                'status': (ctx.get('status') or '').lower(),
-                'conclusion': (ctx.get('conclusion') or '').lower(),
-                'html_url': ctx.get('detailsUrl', ''),
-            }
-        )
-    check_runs.sort(key=lambda x: x['name'])
+    check_runs = parse_status_check_rollup(pr.get('statusCheckRollup'))
 
     latest_comment_time = None
     other_comment_count = 0
@@ -978,6 +944,32 @@ def get_pr_check_runs(pr_number: str, head_sha: str, repo_owner: str, repo_name:
             latest_by_name[name] = cr
 
     return sorted(latest_by_name.values(), key=lambda x: x['name']), True
+
+
+def parse_status_check_rollup(rollup: list[dict] | None) -> list[dict]:
+    """Reduce a GitHub statusCheckRollup to one entry per check name.
+
+    GitHub returns every run for the PR's head SHA, so a check name can appear
+    multiple times (e.g. retries). We keep the most recent by completedAt so a
+    flaky-then-passing run reports as success, not failure.
+    """
+    latest_by_name: dict[str, dict] = {}
+    for ctx in rollup or []:
+        if not ctx or ctx.get('__typename') != 'CheckRun':
+            continue
+        name = ctx.get('name', '')
+        completed_at = ctx.get('completedAt', '') or ctx.get('startedAt', '') or ''
+        existing = latest_by_name.get(name)
+        if existing and existing.get('completed_at', '') >= completed_at:
+            continue
+        latest_by_name[name] = {
+            'name': name,
+            'status': (ctx.get('status') or '').lower(),
+            'conclusion': (ctx.get('conclusion') or '').lower(),
+            'html_url': ctx.get('detailsUrl', ''),
+            'completed_at': completed_at,
+        }
+    return sorted(latest_by_name.values(), key=lambda x: x['name'])
 
 
 def get_ci_status_summary(check_runs: list[dict]) -> tuple[str, str, str | None]:

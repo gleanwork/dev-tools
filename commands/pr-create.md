@@ -8,7 +8,7 @@ Goal: create a clean PR branch off master from cherry-picked commits, run checks
 
 **Cherry-pick mode** (default): creates a new branch off master, cherry-picks commits, pushes, and opens PR. Operates in the current checkout.
 
-**Worktree mode** (`--wt`): same as cherry-pick mode, but creates a temporary worktree via `sparse-branch.sh` (see `scripts/`) so the main checkout is never touched. Multiple `--wt` calls can run in parallel since each gets its own worktree. Worktree is removed on success.
+**Worktree mode** (`--wt`): same as cherry-pick mode, but creates a temporary worktree via `sparse-branch.sh` (see `scripts/`) so the main checkout is never touched. Multiple `--wt` calls can run in parallel since each gets its own worktree. Worktree is kept after PR creation by default.
 
 **Direct mode** (`--here`): pushes the current branch as-is and opens a PR from it. Use from worktrees or purpose-built branches where the branch itself is the PR.
 
@@ -97,7 +97,7 @@ Skip this entire step in direct mode.
 
 Skip in default and direct modes.
 
-- On success: `git worktree remove ../<slug>` (branch remains — it's the PR branch on origin)
+- On success: keep the worktree and ask the user if they want to remove it (`git worktree remove ../<slug>`). The branch remains either way — it's the PR branch on origin.
 - On unrecoverable error: leave the worktree for debugging, tell user to clean up with `git worktree remove ../<slug>`
 
 ## Examples

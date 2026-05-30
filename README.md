@@ -24,8 +24,8 @@ Standalone tools you run directly.
 | Script | What it does |
 |--------|-------------|
 | [`pr-dash.py`](scripts/pr-dash.py) | Local PR dashboard and inbox — tracks PRs, reviews owed, worktree status, CI state. Flask app with vim keys. |
-| [`freespace.sh`](scripts/freespace.sh) | macOS disk space cleanup — build caches, app caches, system temp, git gc. Safe mode + deep clean (`-f`). |
-| [`sparse-branch.sh`](scripts/sparse-branch.sh) | Create sparse-checkout worktrees (~500MB instead of ~1.5GB). Three modes: `--sparse`, `--min`, `--full`. |
+| [`freespace.sh`](scripts/freespace.sh) | macOS disk space cleanup — build caches, app/Electron/browser caches, stale bazel output bases, Colima VM disk, system temp, git gc. Safe mode + deep clean (`-f`) + `--stale-days N`. |
+| [`sparse-branch.sh`](scripts/sparse-branch.sh) | Create sparse-checkout worktrees. Three modes: `--sparse`, `--min`, `--full`. Accepts multiple names (created in parallel) and `--base`. |
 | [`extract.sh`](scripts/extract.sh) | Extract commits or files to a new branch and create a PR in one shot. |
 | [`make-pr.sh`](scripts/make-pr.sh) | Create or update a draft PR from the current branch. |
 
@@ -57,8 +57,10 @@ python scripts/pr-dash.py
 
 ```bash
 # Add to PATH or run directly
-scripts/freespace.sh        # clean disk (dry run: -n)
+scripts/freespace.sh             # clean disk (dry run: -n, deep clean: -f)
+scripts/freespace.sh --stale-days 0   # also drop every non-main bazel output base
 scripts/sparse-branch.sh my-feature   # create sparse worktree
+scripts/sparse-branch.sh feat-a feat-b feat-c   # create several in parallel
 scripts/extract.sh my-fix "Fix the bug" HEAD   # extract commit to PR
 ```
 
@@ -73,6 +75,10 @@ scripts/extract.sh my-fix "Fix the bug" HEAD   # extract commit to PR
 ### freespace.sh
 
 Set `MAIN_WORKSPACE` to your repo root (defaults to `git rev-parse --show-toplevel`). The script has clearly marked sections for project-specific paths — search for "Add project-specific" comments.
+
+- `BAZEL_ROOT` — bazel output-base root (defaults to `/private/var/tmp/_bazel_$USER`)
+- `--stale-days N` — drop non-main bazel output bases untouched for N+ days (default 3); `--stale-days 0` drops every non-main base (emergency mode, keeps the shared disk cache)
+- `LOG_TRUNCATE_DIRS` — space-separated dirs whose `*.log` files over `LOG_TRUNCATE_THRESHOLD_KB` (default 100 MB) get truncated in place
 
 ### sparse-branch.sh
 

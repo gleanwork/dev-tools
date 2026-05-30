@@ -108,12 +108,17 @@ Use a two-pass review so output is coherent for humans and easy to act on:
    - Explain the change in simple English (what changed and why)
    - Analyze edge cases, downsides, adverse effects, and hidden assumptions
    - Evaluate whether this is the right/sufficient change, and suggest better alternatives only when they are clearly better
-3. **Present results in this order:**
+3. **Verification pass third (silent, required):**
+   - Re-read the actual code for every drafted comment and confirm the claim is true at the cited line. Reject anything based on a misread, stale assumption, or pattern-matched guess.
+   - Check the surrounding context — a "missing" guard/check/cleanup may already exist elsewhere in the function, caller, or framework.
+   - Drop anything that is not both **valid** (factually correct against the code) and **significant** (worth a reviewer's attention). Style nits with no real impact, speculative concerns, and "consider whether..." musings get cut.
+   - If a finding survives but you are not fully confident, either downgrade it to a question or drop it. Better to under-report than to post wrong/noisy comments.
+4. **Present results in this order:**
    - `Simple-English PR understanding` (2-4 lines)
-   - `Quick code-level findings` (actionable, comment-ready)
+   - `Quick code-level findings` (actionable, comment-ready, post-verification only)
    - `Deep risks / sufficiency / alternatives` (the "meat")
 
-This keeps momentum (quick issues first) without skipping strategic review.
+This keeps momentum (quick issues first) without skipping strategic review, and the verification gate keeps signal high.
 
 ### Edge-case and downside checklist (required in deep pass)
 
@@ -361,6 +366,7 @@ Don't just explain — actively look for problems:
 ## Guidelines
 
 - **Concise over verbose** — short, direct comments. No filler.
+- **Verify before showing** — every finding must be fact-checked against the actual code. Only surface comments that are both valid and significant; drop the rest silently.
 - **Two voices** — use 🔴/🟡/✅ tags in review output for the user; draft comments posted to the PR are natural human language, no tags
 - **NEVER post without approval** — always confirm first
 - **Always inline** — never PR-level comments, always find the right line
