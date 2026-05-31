@@ -29,6 +29,16 @@ Standalone tools you run directly.
 | [`extract.sh`](scripts/extract.sh) | Extract commits or files to a new branch and create a PR in one shot. |
 | [`make-pr.sh`](scripts/make-pr.sh) | Create or update a draft PR from the current branch. |
 
+### [`distill/`](distill/)
+
+A small system that watches your coding sessions and suggests when to capture a reusable doc for your AI — a command + an always-on rule + a `stop` hook. Suggest-only.
+
+| Piece | What it does |
+|-------|-------------|
+| [`commands/distill.md`](distill/commands/distill.md) | The writer: a doc-type catalog (system, pr-plan, revert-list, trace-diff, followups, …) + templates |
+| [`rules/distillation.md`](distill/rules/distillation.md) | Always-on: watches the session and suggests `/distill <type>` at the right moment |
+| [`hooks/distill-detect.sh`](distill/hooks/distill-detect.sh) | Deterministic backstop: nudges toward a pr-plan when a branch drifts too far ahead of base |
+
 ## Quick start
 
 ### Commands (for Cursor / Claude Code)
