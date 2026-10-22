@@ -1,30 +1,26 @@
 # Syncing with upstream
 
-Most of this repo is a generalized copy of tools maintained inside Glean's internal monorepo and a
-personal skills repo. This file records where each piece comes from and what gets rewritten on the
-way out, so a re-sync is mechanical and nothing project-specific leaks.
+The scripts and the `pr` skill are generalized copies of tools that are maintained privately and
+synced here. This file records which pieces have an upstream and what gets rewritten on the way out,
+so a re-sync is mechanical and nothing project-specific leaks.
 
-## Path map
+## What has an upstream
 
-| Here | Upstream | Status |
-|------|----------|--------|
-| `scripts/freespace.sh` | monorepo `tools/freespace.sh` | active upstream |
-| `scripts/pr-dash.py` | monorepo `tools/pr-dash.py` | active upstream |
-| `scripts/sparse-branch.sh` | monorepo `tools/dev/sparse-branch.sh` | active upstream |
-| `scripts/extract.sh` | monorepo `tools/dev/extract.sh` | active upstream |
-| `scripts/make-pr.sh` | monorepo `tools/dev/make-pr.sh` | active upstream |
-| `skills/pr/` | personal skills repo `pr/` | active upstream |
-| `commands/pr*.md`, `commands/git-mergetool.md` | monorepo `.codeagent/commands/pr_*.md`, `git_mergetool.md` | **removed upstream 2026-09** (superseded by a skill); this repo is now the only home |
-| `distill/` | monorepo branch, never merged | this repo is the only home |
+| Here | Status |
+|------|--------|
+| `scripts/` (all five) | active upstream; synced from its default branch |
+| `skills/pr/` | active upstream; synced from its HEAD |
+| `commands/` | upstream removed 2026-09 (superseded by the skill); this repo is the only home |
+| `distill/` | this repo is the only home |
 
-Last sync: 2026-10-22 (monorepo master, personal skills repo HEAD).
+Last sync: 2026-10-22.
 
 ## Procedure
 
 1. Copy the upstream file over the local one.
-2. Apply the generalization rules below. Grep for the project tokens afterwards:
-   `grep -nE 'scio|askscio|glean|python_scio|devdock|tools/onboarding|\bsi/' <file>`
-   The only acceptable hit is the "Glean" desktop app in `freespace.sh`'s Electron-cache list.
+2. Apply the generalization rules below. Afterwards grep the file for the upstream project's name,
+   repo names, internal directory names, people, and the maintainer's branch prefix. The only
+   acceptable product-name hit is the "Glean" desktop app in `freespace.sh`'s Electron-cache list.
 3. `bash -n` every shell script; `python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())'`
    for Python; `node skills/pr/tests/prSkillConformance.mjs` for the skill.
 4. Update the relevant README for new flags or variables.
@@ -35,8 +31,8 @@ Last sync: 2026-10-22 (monorepo master, personal skills repo HEAD).
 ### All files
 - Project paths, branch prefixes (`si/`), people's names, and product names in examples become
   neutral ones (`jd/`, `Jane Doe`, `[search]`, `api.proto`).
-- References to internal rule files or commands (`git_create_pr.md`, `/greenify`, `/git gost`,
-  `tools/onboarding/...`) become "your project's ..." or the behavior they stand for, inline.
+- References to internal rule files, slash commands, or onboarding scripts become "your
+  project's ..." or the behavior they stand for, inline.
 
 ### `freespace.sh`
 - `BAZEL_ROOT` overridable via environment.

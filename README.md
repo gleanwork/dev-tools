@@ -125,7 +125,7 @@ Every project-specific path is an environment variable; nothing needs editing in
 
 ## Upstream
 
-These tools are maintained in Glean's internal monorepo and synced here with project-specific paths generalized. [`SYNC.md`](SYNC.md) records the path map and the generalization rules.
+The scripts and the `pr` skill are maintained privately at Glean and synced here with project-specific paths generalized; the commands and `distill` live only here. [`SYNC.md`](SYNC.md) records what has an upstream and the generalization rules.
 
 ## License
 
