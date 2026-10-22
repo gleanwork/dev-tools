@@ -7,13 +7,27 @@ Aggregates PRs from three sources into a single view:
   2. Extra branches listed in ~/.worktrees.txt
   3. Open PRs authored by you that aren't checked out locally
 
-Auto-refreshes on a 1-minute cadence (adaptive: 10 min when idle, 15 s on errors).
+PRs are aggregated across several repos: the repo containing the current directory
+plus any extras listed in PR_DASH_REPOS (none by default).
+
+Polls PR metadata every 30 s and running CI every 15 s while viewed (10 min when idle).
+Unchanged comments and settled CI are reused for up to 5 min; Refresh bypasses these caches.
 
 Environment variables:
   PR_DASH_DEBUG=1          Enable verbose logging (also: WORKTREES_DEBUG)
   PR_DASH_CMD_TIMEOUT=30   Per-command timeout in seconds (also: WORKTREES_CMD_TIMEOUT)
   PR_DASH_BATCH_SIZE=15    Branches per GraphQL batch (also: WORKTREES_BATCH_SIZE)
   PR_DASH_PARALLEL=4       Parallel batch workers (also: WORKTREES_PARALLEL)
+  PR_DASH_RATE_LIMIT_COOLDOWN=900
+                           Seconds without GitHub calls after GitHub reports a rate
+                           limit (the limits are per user, shared with every other
+                           tool signed in as you).
+  PR_DASH_REPOS=...        Comma-separated extra repos to include, each
+                           "owner/name" or "owner/name=/path/to/checkout".
+                           Unset or empty for current repo only.
+  PR_DASH_BOTS=...         Comma-separated extra bot logins to hide from the
+                           reviewer list (any *[bot], *-bot, *-ci login is
+                           already treated as a bot).
 
 Requires: gh (GitHub CLI), git, flask
 """
@@ -21,6 +35,7 @@ Requires: gh (GitHub CLI), git, flask
 import argparse
 from concurrent.futures import as_completed
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -28,9 +43,12 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import threading
 import time
+from urllib.parse import urlencode
+from urllib.parse import urlsplit
 
 from flask import Flask
 from flask import jsonify
@@ -60,6 +78,74 @@ _repo_info = {
 _api_state: dict[str, datetime | None] = {'last_access': None}
 _api_access_lock = threading.Lock()
 
+# GitHub quota guard. The REST (5,000/h) and GraphQL (5,000 points/h) limits are per *user*,
+# shared with every other tool signed in as you (gh in other shells, the editor, Tau). When GitHub
+# says we are over, every further call is a wasted process and a 403, and a REST fallback on top
+# of a GraphQL limit just drains the second bucket too. So: remember the limit, make no gh calls
+# until it has had time to reset, and let the refresh loop sleep through it instead of retrying
+# every 15 s. GitHub's windows are an hour from the first request, so a hit near the end of a
+# window clears sooner than this; the next cycle after the cooldown finds out either way.
+_RATE_LIMIT_COOLDOWN_SECONDS = int(os.environ.get('PR_DASH_RATE_LIMIT_COOLDOWN', '900'))
+_rate_limit_state: dict[str, datetime | None] = {'until': None}
+_rate_limit_lock = threading.Lock()
+
+# Closed PR details rarely change; updatedAt invalidates edits made after closing.
+_closed_pr_cache: dict[tuple[str, str], tuple[str, dict]] = {}
+_closed_pr_cache_lock = threading.Lock()
+
+_METADATA_INTERVAL = 30
+_ACTIVE_CI_INTERVAL = 15
+_SETTLED_INTERVAL = 300
+_CLOSED_LIST_INTERVAL = 600
+
+# Cache raw snapshots, not parsed rows: relative times and local git state still update each cycle.
+_list_cache: dict[tuple[str, ...], tuple[float, list[dict]]] = {}
+# One bounded (at most 200 numbers) authoritative open-PR snapshot per configured repo.
+_open_pr_numbers: dict[str, set[int]] = {}
+_field_cache: dict[tuple[str, str, str], tuple[tuple[str, ...], float, dict]] = {}
+_rest_cache: dict[str, tuple[dict[str, str], dict | list]] = {}
+_fetch_cache_lock = threading.Lock()
+_refresh_wakeup = threading.Event()
+
+
+def _store_snapshot(cache: dict, key: object, value: object) -> None:
+    """Bound each cache to 1024 snapshots of at most 128 KiB of encoded data each.
+
+    Oversized snapshots are served uncached; the oldest entry is evicted on overflow.
+    The caller holds the cache's lock.
+    """
+    if len(json.dumps(value).encode()) > 128 * 1024:
+        cache.pop(key, None)
+        return
+    if len(cache) >= 1024 and key not in cache:
+        cache.pop(next(iter(cache)))
+    cache[key] = deepcopy(value)
+
+
+def _is_rate_limit_error(message: str) -> bool:
+    lowered = (message or '').lower()
+    return 'rate limit' in lowered or 'secondary limit' in lowered or 'abuse detection' in lowered
+
+
+def _note_rate_limited(message: str) -> None:
+    """Start (or extend) the cooldown after GitHub reported a rate limit."""
+    until = datetime.now(timezone.utc) + timedelta(seconds=_RATE_LIMIT_COOLDOWN_SECONDS)
+    with _rate_limit_lock:
+        current = _rate_limit_state['until']
+        if current is None or until > current:
+            _rate_limit_state['until'] = until
+            print(f'[gh] GitHub rate limit hit; no GitHub calls until {until:%H:%M:%S} UTC ({message[:120]})')
+
+
+def rate_limited_until() -> datetime | None:
+    """When the cooldown ends, or None when GitHub calls are allowed."""
+    with _rate_limit_lock:
+        until = _rate_limit_state['until']
+        if until and until <= datetime.now(timezone.utc):
+            _rate_limit_state['until'] = None
+            return None
+        return until
+
 
 def run_command(cmd: list[str], capture_output: bool = True, debug: bool = False) -> tuple[bool, str]:
     """Run a shell command and return success status and output."""
@@ -72,9 +158,15 @@ def run_command(cmd: list[str], capture_output: bool = True, debug: bool = False
             check=False,
             timeout=timeout,
         )
-        if result.returncode != 0 and debug:
-            print(f'[cmd] {" ".join(cmd[:3])}... failed: {result.stderr[:100] if result.stderr else "no stderr"}')
-        return result.returncode == 0, result.stdout.strip()
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            # gh treats 304 as an error. Keep included HTTP responses so the caller can
+            # distinguish Not Modified from a failed fetch without retrying it.
+            if not (cmd[:2] == ['gh', 'api'] and '--include' in cmd and output.startswith('HTTP/')):
+                output = result.stderr.strip() or output
+            if debug:
+                print(f'[cmd] {" ".join(cmd[:3])}... failed: {output[:100] if output else "no output"}')
+        return result.returncode == 0, output
     except subprocess.TimeoutExpired:
         if debug:
             print(f'[cmd] {" ".join(cmd[:3])}... timed out after {timeout}s')
@@ -90,12 +182,25 @@ def run_gh_command(cmd: list[str], max_retries: int = 3) -> tuple[bool, str]:
     debug = os.environ.get('PR_DASH_DEBUG', os.environ.get('WORKTREES_DEBUG', '')).lower() in ('1', 'true', 'yes')
     last_error = ''
 
+    if rate_limited_until():
+        # Every call during the cooldown would be another 403; spend nothing.
+        return False, 'GitHub rate limit cooldown'
+
     for attempt in range(max_retries):
         success, output = run_command(cmd, debug=debug)
-        if success:
+        not_modified = (
+            cmd[:2] == ['gh', 'api']
+            and '--include' in cmd
+            and output.startswith('HTTP/')
+            and output.splitlines()[0].split()[1:2] == ['304']
+        )
+        if success or not_modified:
             return True, output
 
         last_error = output
+        if _is_rate_limit_error(last_error):
+            _note_rate_limited(last_error)
+            return False, last_error
 
         if attempt < max_retries - 1:
             # Exponential backoff with jitter: base * 2^attempt + random jitter
@@ -113,18 +218,112 @@ def run_gh_command(cmd: list[str], max_retries: int = 3) -> tuple[bool, str]:
     return False, ''
 
 
+def _parallel_workers() -> int:
+    """Worker count for parallel per-PR fetches (PR_DASH_PARALLEL / WORKTREES_PARALLEL)."""
+    return max(1, int(os.environ.get('PR_DASH_PARALLEL', os.environ.get('WORKTREES_PARALLEL', '4'))))
+
+
 def get_repo_info() -> tuple[str, str]:
     """Get repository owner and name."""
     if _repo_info['owner'] and _repo_info['name']:
         return _repo_info['owner'], _repo_info['name']
 
     success, output = run_gh_command(['gh', 'repo', 'view', '--json', 'owner,name', '-q', '.owner.login + "|" + .name'])
-    if not success or not output:
-        return '', ''
-    owner, name = output.split('|', 1)
+    if success and output and '|' in output:
+        owner, name = output.split('|', 1)
+    else:
+        success, output = run_command(['git', 'remote', 'get-url', 'origin'])
+        nwo = _remote_to_nwo(output) if success else ''
+        if '/' not in nwo:
+            return '', ''
+        owner, name = nwo.split('/', 1)
+
     _repo_info['owner'] = owner
     _repo_info['name'] = name
     return owner, name
+
+
+# Repos aggregated in addition to the one containing the current directory.
+# Override with PR_DASH_REPOS; e.g. 'myorg/other-repo,myorg/mobile=/path/to/mobile'.
+_DEFAULT_EXTRA_REPOS: list[str] = []
+
+_repos_state: dict[str, list[dict] | None] = {'repos': None}
+_repos_lock = threading.Lock()
+
+
+def _remote_to_nwo(url: str) -> str:
+    """Reduce a git remote URL to "owner/name"."""
+    url = url.strip()
+    if url.endswith('.git'):
+        url = url[:-4]
+    parts = [p for p in url.replace(':', '/').split('/') if p]
+    if len(parts) >= 2:
+        return f'{parts[-2]}/{parts[-1]}'
+    return ''
+
+
+def _detect_local_path(nwo: str) -> str:
+    """Find a local checkout of owner/name by probing common sibling locations."""
+    name = nwo.split('/')[-1]
+    cwd = Path.cwd()
+    candidates = [cwd.parent / name, Path.home() / 'workspace' / name, Path.home() / name]
+    for candidate in candidates:
+        if not (candidate / '.git').exists():
+            continue
+        success, output = run_command(['git', '-C', str(candidate), 'remote', 'get-url', 'origin'])
+        if success and output and _remote_to_nwo(output) == nwo:
+            return str(candidate)
+    return ''
+
+
+def get_repos() -> list[dict]:
+    """Repos to aggregate: the current directory's repo first, then PR_DASH_REPOS extras.
+
+    Each entry is {'nwo', 'owner', 'name', 'path', 'primary'}. 'path' is a local
+    checkout used for worktree/dirty state, and is empty when none was found.
+    """
+    with _repos_lock:
+        cached = _repos_state['repos']
+    if cached is not None:
+        return cached
+
+    repos: list[dict] = []
+    seen: set[str] = set()
+
+    owner, name = get_repo_info()
+    if owner and name:
+        nwo = f'{owner}/{name}'
+        seen.add(nwo)
+        repos.append({'nwo': nwo, 'owner': owner, 'name': name, 'path': str(Path.cwd()), 'primary': True})
+
+    raw = os.environ.get('PR_DASH_REPOS')
+    specs = raw.split(',') if raw is not None else list(_DEFAULT_EXTRA_REPOS)
+    for spec in specs:
+        spec_nwo, _, spec_path = spec.partition('=')
+        spec_nwo = spec_nwo.strip()
+        if '/' not in spec_nwo or spec_nwo in seen:
+            continue
+        seen.add(spec_nwo)
+        extra_owner, extra_name = spec_nwo.split('/', 1)
+        repos.append(
+            {
+                'nwo': spec_nwo,
+                'owner': extra_owner,
+                'name': extra_name,
+                'path': spec_path.strip() or _detect_local_path(spec_nwo),
+                'primary': False,
+            }
+        )
+
+    if repos:
+        with _repos_lock:
+            _repos_state['repos'] = repos
+    return repos
+
+
+def make_pr_key(nwo: str, branch: str) -> str:
+    """Cache/row key for a PR. Branch names collide across repos, so scope by repo."""
+    return f'{nwo}#{branch}'
 
 
 def get_current_user() -> str:
@@ -152,6 +351,11 @@ _conflict_cache: dict[str, bool] = {}
 _conflict_cache_lock = threading.Lock()
 
 
+# statusCheckRollup and comments are expensive GraphQL sub-queries: including them
+# in a `gh pr list` over many open PRs makes GitHub return HTTP 504. They're fetched
+# per-PR (cheap) and merged in instead — see _fetch_pr_heavy_fields.
+_PR_HEAVY_FIELDS = ['statusCheckRollup', 'comments']
+
 _PR_LIST_FIELDS = ','.join(
     [
         'number',
@@ -175,6 +379,8 @@ _PR_LIST_FIELDS = ','.join(
     ]
 )
 
+_PR_LIST_FIELDS_LIGHT = ','.join(f for f in _PR_LIST_FIELDS.split(',') if f not in _PR_HEAVY_FIELDS)
+
 _REVIEW_REQUEST_FIELDS = ','.join(
     [
         'number',
@@ -185,6 +391,7 @@ _REVIEW_REQUEST_FIELDS = ','.join(
         'updatedAt',
         'createdAt',
         'headRefName',
+        'headRefOid',
         'author',
         'reviewDecision',
         'reviews',
@@ -195,25 +402,382 @@ _REVIEW_REQUEST_FIELDS = ','.join(
 )
 
 
-def fetch_user_prs() -> tuple[dict[str, dict], bool]:
-    """Fetch all relevant PRs authored by the current user from GitHub.
+_REVIEW_REQUEST_FIELDS_LIGHT = ','.join(f for f in _REVIEW_REQUEST_FIELDS.split(',') if f not in _PR_HEAVY_FIELDS)
 
-    Returns (branch_to_pr dict, success bool). Includes open PRs,
-    closed-but-unmerged PRs, and recently merged PRs (last 30 days).
 
-    Uses a two-phase approach for closed PRs to avoid GitHub API timeouts:
-    lightweight scan to find relevant PRs, then individual detail fetches.
+def _fetch_pr_list(cmd: list[str], max_age: float, force: bool = False) -> tuple[list[dict], bool]:
+    """Reuse discovery snapshots between their polls, never caching failed responses."""
+    key = tuple(cmd)
+    with _fetch_cache_lock:
+        cached = _list_cache.get(key)
+    if cached and not force and time.monotonic() - cached[0] < max_age:
+        return deepcopy(cached[1]), True
+    with _fetch_cache_lock:
+        _list_cache.pop(key, None)
+    ok, output = run_gh_command(cmd)
+    if not ok:
+        return [], False
+    try:
+        prs = json.loads(output)
+    except json.JSONDecodeError:
+        return [], False
+    if not isinstance(prs, list) or not all(isinstance(pr, dict) for pr in prs):
+        return [], False
+    with _fetch_cache_lock:
+        _store_snapshot(_list_cache, key, (time.monotonic(), prs))
+    return prs, True
+
+
+def _fetch_pr_heavy_fields(
+    nwo: str, pr_number: str, fields: list[str] | None = None, expected_head: str = ''
+) -> tuple[str, dict] | None:
+    """Fetch only the expensive fields whose cached snapshots need revalidation."""
+    fields = _PR_HEAVY_FIELDS if fields is None else fields
+    ok, detail = run_gh_command(
+        ['gh', 'pr', 'view', pr_number, '--repo', nwo, '--json', ','.join(['number', 'headRefOid', *fields])]
+    )
+    if ok and detail:
+        try:
+            data = json.loads(detail)
+            if isinstance(data, dict) and all(
+                field in data and isinstance(data[field], (list, type(None))) for field in fields
+            ):
+                if expected_head and data.get('headRefOid') != expected_head:
+                    return None
+                return pr_number, {field: data[field] for field in fields}
+        except json.JSONDecodeError:
+            pass
+
+    if rate_limited_until():
+        return None
+    rest_data = _fetch_rest_pr_details(nwo, pr_number, fields=','.join(fields))
+    if not rest_data or (expected_head and rest_data.get('headRefOid') != expected_head):
+        return None
+    return pr_number, {field: rest_data[field] for field in fields}
+
+
+def _enrich_open_pr(nwo: str, pr: dict, include_comments: bool = True, force: bool = False) -> dict:
+    """Invalidate comments on PR activity, but poll CI independently of updatedAt."""
+    full = dict(pr)
+    number = str(pr['number'])
+    head = str(pr.get('headRefOid') or '')
+    fields = _PR_HEAVY_FIELDS if include_comments else ['statusCheckRollup']
+    due: list[str] = []
+    revisions: dict[str, tuple[str, ...]] = {}
+    for field in fields:
+        revision = (head,) if field == 'statusCheckRollup' else (head, str(pr.get('updatedAt') or ''))
+        revisions[field] = revision
+        with _fetch_cache_lock:
+            cached = _field_cache.get((nwo, number, field))
+        if cached:
+            cached_revision, fetched_at, data = cached
+            # Never carry CI for a previous head onto a newly pushed commit.
+            if cached_revision[0] == head:
+                full.update(deepcopy(data))
+            rollup = data.get('statusCheckRollup')
+            settled = rollup and all(
+                (ctx.get('status') or '').upper() == 'COMPLETED'
+                or (ctx.get('__typename') == 'StatusContext' and ctx.get('state') in ('SUCCESS', 'FAILURE', 'ERROR'))
+                for ctx in rollup
+                if ctx
+            )
+            if field == 'statusCheckRollup' and not rollup:
+                # Repositories without CI should not be polled as perpetually running.
+                # Allow two minutes for checks to register after recent PR activity.
+                changed_at = parse_timestamp(pr.get('updatedAt'))
+                settled = changed_at is None or (datetime.now(timezone.utc) - changed_at).total_seconds() >= 120
+            max_age = _ACTIVE_CI_INTERVAL if field == 'statusCheckRollup' and not settled else _SETTLED_INTERVAL
+            if not force and head and cached_revision == revision and time.monotonic() - fetched_at < max_age:
+                continue
+        due.append(field)
+
+    if due:
+        result = _fetch_pr_heavy_fields(nwo, number, due, expected_head=head)
+        if result is None:
+            full['_details_stale'] = True
+            # A failed forced refresh must retry too, even if the old snapshot's
+            # normal TTL has not expired. Keep its data, but not its freshness.
+            with _fetch_cache_lock:
+                for field in due:
+                    key = (nwo, number, field)
+                    cached = _field_cache.get(key)
+                    if cached:
+                        _store_snapshot(_field_cache, key, (cached[0], time.monotonic() - _SETTLED_INTERVAL, cached[2]))
+        else:
+            full.update(result[1])
+            with _fetch_cache_lock:
+                for field in due:
+                    _store_snapshot(
+                        _field_cache,
+                        (nwo, number, field),
+                        (revisions[field], time.monotonic(), {field: result[1][field]}),
+                    )
+    return full
+
+
+def _fetch_search_pr_numbers(nwo: str, query: str, max_pages: int = 1) -> tuple[list[str], bool]:
+    """Find PR numbers through GitHub's conditionally revalidated REST search API."""
+    numbers: list[str] = []
+    for page in range(1, max_pages + 1):
+        params = urlencode(
+            {'q': f'repo:{nwo} {query}', 'per_page': 100, 'page': page, 'sort': 'updated', 'order': 'desc'}
+        )
+        data = _fetch_rest_json(f'search/issues?{params}')
+        if not isinstance(data, dict) or not isinstance(data.get('items'), list) or data.get('incomplete_results'):
+            return [], False
+        if not all(isinstance(item, dict) and isinstance(item.get('number'), int) for item in data['items']):
+            return [], False
+        page_numbers = [str(item['number']) for item in data['items']]
+        numbers.extend(page_numbers)
+        if len(page_numbers) < 100:
+            break
+    return numbers, True
+
+
+def _fetch_authored_pr_numbers(nwo: str, state: str, username: str) -> tuple[list[str], bool]:
+    """Find authored PR numbers with REST when the gh author filter is unavailable."""
+    if not username:
+        return [], False
+    return _fetch_search_pr_numbers(nwo, f'is:pr is:{state} author:{username}', max_pages=2)
+
+
+def _fetch_rest_page(endpoint: str) -> tuple[dict | list, dict[str, str]] | None:
+    """Revalidate REST pages with ETags; authenticated 304s spend no primary quota."""
+    with _fetch_cache_lock:
+        cached = _rest_cache.get(endpoint)
+    cmd = ['gh', 'api', endpoint, '--include']
+    if cached and cached[0].get('etag'):
+        cmd.extend(['--header', f'If-None-Match: {cached[0]["etag"]}'])
+    ok, output = run_gh_command(cmd)
+    if not ok:
+        return None
+    headers_text, separator, body = output.replace('\r\n', '\n').partition('\n\n')
+    lines = headers_text.splitlines()
+    status = lines[0].split()[1:2] if lines else []
+    headers = {name.lower(): value.strip() for line in lines[1:] if ':' in line for name, value in [line.split(':', 1)]}
+    if status == ['304'] and cached:
+        # Retain Link as well as the body: a 304 need not repeat pagination headers.
+        headers = {**cached[0], **headers}
+        with _fetch_cache_lock:
+            _store_snapshot(_rest_cache, endpoint, (headers, cached[1]))
+        return deepcopy(cached[1]), headers
+    if status != ['200'] or not separator:
+        return None
+    try:
+        value = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, (dict, list)):
+        return None
+    with _fetch_cache_lock:
+        _store_snapshot(_rest_cache, endpoint, (headers, value))
+    return value, headers
+
+
+def _fetch_rest_json(endpoint: str) -> dict | list | None:
+    """Fetch one JSON resource through GitHub's REST API."""
+    page = _fetch_rest_page(endpoint)
+    return page[0] if page else None
+
+
+def _fetch_rest_items(endpoint: str, jq: str = '.[]') -> list[dict] | None:
+    """Revalidate each REST page; a failed page is never a successful partial list."""
+    items: list[dict] = []
+    for _ in range(20):
+        page = _fetch_rest_page(endpoint)
+        if page is None:
+            return None
+        value, headers = page
+        values = value.get('check_runs') if isinstance(value, dict) and jq == '.check_runs[]' else value
+        if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
+            return None
+        items.extend(values)
+        next_page = re.search(r'<([^>]+)>;\s*rel="next"', headers.get('link', ''))
+        if not next_page:
+            return items
+        url = urlsplit(next_page.group(1))
+        if url.scheme != 'https' or url.netloc != 'api.github.com':
+            return None
+        endpoint = url.path.lstrip('/') + ('?' + url.query if url.query else '')
+    return None
+
+
+def _fetch_rest_pr_details(nwo: str, pr_number: str, enrich: bool = True, fields: str | None = None) -> dict | None:
+    """Build the requested PR fields from REST, without unrelated enrichment calls."""
+    wanted = set((fields if fields is not None else _PR_LIST_FIELDS if enrich else '').split(','))
+    basic = _fetch_rest_json(f'repos/{nwo}/pulls/{pr_number}')
+    if not isinstance(basic, dict):
+        return None
+
+    head = basic.get('head') or {}
+    head_sha = head.get('sha', '')
+    mergeable = basic.get('mergeable')
+    if mergeable is True:
+        mergeable = 'MERGEABLE'
+    elif mergeable is False:
+        mergeable = 'CONFLICTING'
+
+    mapped_reviews = []
+    comments = []
+    check_runs = []
+    if wanted.intersection(('reviews', 'latestReviews')):
+        reviews = _fetch_rest_items(f'repos/{nwo}/pulls/{pr_number}/reviews?per_page=100')
+        if reviews is None:
+            return None
+        mapped_reviews = [
+            {
+                'author': {'login': (review.get('user') or {}).get('login', '')},
+                'state': review.get('state'),
+                'submittedAt': review.get('submitted_at'),
+                'body': review.get('body', ''),
+            }
+            for review in reviews
+        ]
+
+    if 'comments' in wanted:
+        for endpoint in (
+            f'repos/{nwo}/issues/{pr_number}/comments?per_page=100',
+            f'repos/{nwo}/pulls/{pr_number}/comments?per_page=100',
+        ):
+            fetched_comments = _fetch_rest_items(endpoint)
+            if fetched_comments is None:
+                return None
+            for comment in fetched_comments:
+                comments.append(
+                    {
+                        'author': {'login': (comment.get('user') or {}).get('login', '')},
+                        'createdAt': comment.get('created_at'),
+                        'updatedAt': comment.get('updated_at'),
+                    }
+                )
+
+    if 'statusCheckRollup' in wanted and head_sha:
+        checks = _fetch_rest_items(f'repos/{nwo}/commits/{head_sha}/check-runs?per_page=100', '.check_runs[]')
+        if checks is None:
+            return None
+        for check in checks:
+            check_runs.append(
+                {
+                    '__typename': 'CheckRun',
+                    'name': check.get('name', ''),
+                    'workflowName': (check.get('app') or {}).get('name', ''),
+                    'status': check.get('status'),
+                    'conclusion': check.get('conclusion'),
+                    'detailsUrl': check.get('html_url', ''),
+                    'completedAt': check.get('completed_at'),
+                    'startedAt': check.get('started_at'),
+                }
+            )
+
+    requested = basic.get('requested_reviewers') or []
+    review_requests = []
+    for reviewer in requested:
+        if reviewer.get('login'):
+            review_requests.append({'login': reviewer['login']})
+        elif reviewer.get('name'):
+            review_requests.append({'__typename': 'Team', 'name': reviewer['name']})
+
+    return {
+        'number': basic.get('number'),
+        'title': basic.get('title', ''),
+        'state': basic.get('state'),
+        'author': {'login': (basic.get('user') or {}).get('login', '')},
+        'isDraft': basic.get('draft', False),
+        'url': basic.get('html_url', ''),
+        'mergedAt': basic.get('merged_at'),
+        'closedAt': basic.get('closed_at'),
+        'updatedAt': basic.get('updated_at'),
+        'createdAt': basic.get('created_at'),
+        'headRefName': head.get('ref', ''),
+        'headRefOid': head_sha,
+        'reviewDecision': None,
+        'reviews': mapped_reviews,
+        'latestReviews': [],
+        'reviewRequests': review_requests,
+        'statusCheckRollup': check_runs,
+        'comments': comments,
+        'mergeable': mergeable,
+    }
+
+
+def _fetch_pr_details(args: tuple[str, str, str]) -> dict | None:
+    """Fetch one PR's requested fields from GraphQL, falling back to REST."""
+    nwo, pr_number, fields = args
+    ok, detail = run_gh_command(['gh', 'pr', 'view', pr_number, '--repo', nwo, '--json', fields])
+    if ok and detail:
+        try:
+            return json.loads(detail)
+        except json.JSONDecodeError:
+            pass
+    if rate_limited_until():
+        # The GraphQL bucket is gone; five REST calls per PR would only take the REST one with it.
+        return None
+    return _fetch_rest_pr_details(nwo, pr_number, fields=fields)
+
+
+def _closed_pr_details(nwo: str, pr: dict, force: bool = False) -> dict | None:
+    """A closed PR's full record: the light list fields plus checks and comments.
+
+    Reuse details while updatedAt is unchanged, unless the user forces a refresh."""
+    number = str(pr.get('number'))
+    updated_at = str(pr.get('updatedAt') or '')
+    key = (nwo, number)
+    with _closed_pr_cache_lock:
+        cached = _closed_pr_cache.get(key)
+    if cached and cached[0] == updated_at and not force:
+        return dict(cached[1])
+
+    heavy = _fetch_pr_heavy_fields(nwo, number)
+    if not heavy:
+        with _closed_pr_cache_lock:
+            _closed_pr_cache.pop(key, None)
+        return {**pr, '_details_stale': True}
+    full = {**pr, **heavy[1]}
+    with _closed_pr_cache_lock:
+        _store_snapshot(_closed_pr_cache, key, (updated_at, full))
+    return full
+
+
+def fetch_user_prs(force: bool = False) -> tuple[dict[str, dict], bool]:
+    """Fetch relevant PRs authored by the current user across all configured repos.
+
+    Returns (key_to_pr dict, open_fetch_success bool) where the key is
+    "owner/name#branch" (see make_pr_key). Success is True only when the open-PR
+    fetch succeeded for every repo, so a stale repo can't silently drop rows.
     """
+    repos = get_repos()
+    if not repos:
+        return {}, False
+
+    all_prs: dict[str, dict] = {}
+    all_success = True
+    with ThreadPoolExecutor(max_workers=len(repos)) as executor:
+        for prs, ok in executor.map(lambda repo: _fetch_user_prs_for_repo(repo, force=force), repos):
+            all_prs.update(prs)
+            all_success = all_success and ok
+    return all_prs, all_success
+
+
+def _fetch_user_prs_for_repo(repo: dict, force: bool = False) -> tuple[dict[str, dict], bool]:
+    """Fetch the current user's PRs for a single repo.
+
+    Includes open PRs, closed-but-unmerged PRs, and recently merged PRs (last 30 days).
+
+    The open discovery list is authoritative. Expensive fields are revalidated only
+    when due or invalidated; closed discovery is slower and supplementary.
+    """
+    nwo = repo['nwo']
     current_user = get_current_user()
     all_prs: dict[str, dict] = {}
-    any_success = False
     debug = os.environ.get('PR_DASH_DEBUG', os.environ.get('WORKTREES_DEBUG', '')).lower() in ('1', 'true', 'yes')
 
-    success, output = run_gh_command(
+    raw_open, open_success = _fetch_pr_list(
         [
             'gh',
             'pr',
             'list',
+            '--repo',
+            nwo,
             '--author',
             '@me',
             '--state',
@@ -221,29 +785,59 @@ def fetch_user_prs() -> tuple[dict[str, dict], bool]:
             '--limit',
             '200',
             '--json',
-            _PR_LIST_FIELDS,
-        ]
+            _PR_LIST_FIELDS_LIGHT,
+        ],
+        _METADATA_INTERVAL,
+        force=force,
     )
-    if success and output:
-        any_success = True
-        try:
-            for raw_pr in json.loads(output):
-                branch = raw_pr.get('headRefName', '')
-                if branch:
-                    parsed = _parse_pr(raw_pr, current_user)
-                    if parsed:
-                        all_prs[branch] = parsed
-        except (json.JSONDecodeError, KeyError) as e:
-            if debug:
-                print(f'[fetch] Failed to parse open PRs: {e}')
-    elif debug:
-        print('[fetch] gh pr list --state open failed')
 
-    success, output = run_gh_command(
+    if not open_success:
+        open_numbers, fallback_success = _fetch_authored_pr_numbers(nwo, 'open', current_user)
+        if fallback_success:
+            open_success = True
+            with ThreadPoolExecutor(max_workers=_parallel_workers()) as executor:
+                raw_open = [
+                    pr
+                    for pr in executor.map(
+                        _fetch_pr_details,
+                        [(nwo, number, _PR_LIST_FIELDS_LIGHT) for number in open_numbers],
+                    )
+                    if pr
+                ]
+            open_success = len(raw_open) == len(open_numbers)
+            if debug:
+                print(f'[fetch] {nwo}: REST fallback found {len(raw_open)} open PRs')
+        elif debug:
+            print(f'[fetch] {nwo}: open PR fetch failed, including REST fallback')
+
+    closed_force = force
+    if open_success:
+        numbers = {pr['number'] for pr in raw_open if pr.get('number') is not None}
+        with _fetch_cache_lock:
+            previous = _open_pr_numbers.get(nwo, numbers)
+            _open_pr_numbers[nwo] = numbers
+        # A PR leaving the open list must appear as closed/merged immediately, not
+        # disappear until the slower closed discovery poll catches up.
+        closed_force = force or bool(previous - numbers)
+        with ThreadPoolExecutor(max_workers=_parallel_workers()) as executor:
+            for raw_pr in executor.map(
+                lambda pr: _enrich_open_pr(nwo, pr, force=force),
+                [pr for pr in raw_open if pr.get('headRefName') and pr.get('number') is not None],
+            ):
+                branch = raw_pr['headRefName']
+                parsed = _parse_pr(raw_pr, current_user, repo)
+                if parsed:
+                    all_prs[make_pr_key(nwo, branch)] = parsed
+
+    # Closed discovery normally runs every ten minutes, or when a PR leaves the open list.
+    merged_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    raw_closed, closed_success = _fetch_pr_list(
         [
             'gh',
             'pr',
             'list',
+            '--repo',
+            nwo,
             '--author',
             '@me',
             '--state',
@@ -251,149 +845,96 @@ def fetch_user_prs() -> tuple[dict[str, dict], bool]:
             '--limit',
             '200',
             '--json',
-            'number,headRefName,mergedAt',
-        ]
+            _PR_LIST_FIELDS_LIGHT,
+        ],
+        _CLOSED_LIST_INTERVAL,
+        force=closed_force,
     )
-    if success and output:
-        any_success = True
-        merged_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    relevant_closed: list[dict] = []
+    if closed_success:
         try:
-            detail_numbers = []
-            for pr in json.loads(output):
-                if not pr.get('headRefName'):
+            for pr in raw_closed:
+                if not isinstance(pr, dict) or not pr.get('headRefName') or pr.get('number') is None:
                     continue
                 merged_at = pr.get('mergedAt')
                 if not merged_at:
-                    detail_numbers.append(str(pr['number']))
+                    relevant_closed.append(pr)
                 else:
                     merged_time = parse_timestamp(merged_at)
                     if merged_time and merged_time >= merged_cutoff:
-                        detail_numbers.append(str(pr['number']))
-        except (json.JSONDecodeError, KeyError):
-            detail_numbers = []
+                        relevant_closed.append(pr)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            closed_success = False
 
+    if not closed_success and not rate_limited_until():
+        # GraphQL list failed for a reason other than quota: find the numbers through REST search
+        # and take each PR's basic record (one REST call each, no checks or comments).
+        numbers, search_success = _fetch_authored_pr_numbers(nwo, 'closed', current_user)
+        if search_success:
+            closed_success = True
+            if debug:
+                print(f'[fetch] {nwo}: using REST fallback for closed PR discovery')
+            with ThreadPoolExecutor(max_workers=_parallel_workers()) as executor:
+                for raw_pr in executor.map(lambda n: _fetch_rest_pr_details(nwo, n, enrich=False), numbers[:20]):
+                    if not raw_pr or not raw_pr.get('headRefName'):
+                        continue
+                    merged_at = raw_pr.get('mergedAt')
+                    if merged_at:
+                        merged_time = parse_timestamp(merged_at)
+                        if not merged_time or merged_time < merged_cutoff:
+                            continue
+                    relevant_closed.append(raw_pr)
+
+    if closed_success:
         if debug:
-            print(f'[fetch] Found {len(detail_numbers)} closed/recently-merged PRs')
+            print(f'[fetch] {nwo}: found {len(relevant_closed)} closed/recently-merged PRs')
 
-        def _fetch_one_pr(pr_number: str) -> tuple[str, dict] | None:
-            ok, detail = run_gh_command(
-                [
-                    'gh',
-                    'pr',
-                    'view',
-                    pr_number,
-                    '--json',
-                    _PR_LIST_FIELDS,
-                ]
-            )
-            if not ok or not detail:
+        def _closed_row(pr: dict) -> tuple[str, dict] | None:
+            full = _closed_pr_details(nwo, pr, force=force)
+            if not full:
                 return None
-            try:
-                raw_pr = json.loads(detail)
-                branch = raw_pr.get('headRefName', '')
-                if branch:
-                    parsed = _parse_pr(raw_pr, current_user)
-                    if parsed:
-                        return (branch, parsed)
-            except (json.JSONDecodeError, KeyError):
-                pass
-            return None
+            branch = full.get('headRefName', '')
+            parsed = _parse_pr(full, current_user, repo) if branch else None
+            return (make_pr_key(nwo, branch), parsed) if parsed else None
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            for result in executor.map(_fetch_one_pr, detail_numbers):
-                if result:
-                    branch, parsed = result
-                    if branch not in all_prs:
-                        all_prs[branch] = parsed
+        with ThreadPoolExecutor(max_workers=_parallel_workers()) as executor:
+            for result in executor.map(_closed_row, relevant_closed):
+                if result and result[0] not in all_prs:
+                    all_prs[result[0]] = result[1]
     elif debug:
-        print('[fetch] gh pr list --state closed failed')
+        print(f'[fetch] {nwo}: closed PR fetch failed, including REST fallback')
 
-    return all_prs, any_success
+    return all_prs, open_success
 
 
-def fetch_review_requests() -> tuple[list[dict], bool]:
-    """Fetch PRs needing review and recently reviewed by the current user.
+def fetch_review_requests(force: bool = False) -> tuple[list[dict], bool]:
+    """Fetch PRs needing review and recently reviewed by the current user, across repos.
 
     Returns pending review requests (direct + team-based) and open PRs
     the user has already reviewed. Each entry is tagged with review_status
     ('pending'/'reviewed') and is_direct_request so the frontend can filter:
     active-only mode shows only pending direct requests.
     """
-    debug = os.environ.get('PR_DASH_DEBUG', os.environ.get('WORKTREES_DEBUG', '')).lower() in ('1', 'true', 'yes')
     current_user = get_current_user()
-    any_success = False
-
-    success, output = run_gh_command(
-        [
-            'gh',
-            'pr',
-            'list',
-            '--search',
-            'review-requested:@me',
-            '--state',
-            'open',
-            '--limit',
-            '100',
-            '--json',
-            _REVIEW_REQUEST_FIELDS,
-        ]
-    )
-    pending_prs: list[dict] = []
-    if success and output:
-        any_success = True
-        try:
-            pending_prs = json.loads(output)
-        except json.JSONDecodeError:
-            if debug:
-                print('[fetch] Failed to parse pending review requests JSON')
-
-    success, output = run_gh_command(
-        [
-            'gh',
-            'pr',
-            'list',
-            '--search',
-            'reviewed-by:@me -author:@me',
-            '--state',
-            'open',
-            '--limit',
-            '50',
-            '--json',
-            _REVIEW_REQUEST_FIELDS,
-        ]
-    )
-    reviewed_prs: list[dict] = []
-    if success and output:
-        any_success = True
-        try:
-            reviewed_prs = json.loads(output)
-        except json.JSONDecodeError:
-            if debug:
-                print('[fetch] Failed to parse reviewed PRs JSON')
-
-    if not any_success:
+    repos = get_repos()
+    if not repos:
         return [], False
 
-    pending_numbers = {pr.get('number') for pr in pending_prs}
-    for pr in pending_prs:
-        is_direct = any(
-            (req.get('login') or '').lower() == current_user.lower()
-            for req in (pr.get('reviewRequests', []) or [])
-            if req
-        )
-        pr['_review_status'] = 'pending'
-        pr['_is_direct_request'] = is_direct
+    pending_prs: list[dict] = []
+    all_success = True
+    with ThreadPoolExecutor(max_workers=len(repos)) as executor:
+        for prs, ok in executor.map(lambda repo: _fetch_review_requests_for_repo(repo, force=force), repos):
+            pending_prs.extend(prs)
+            all_success = all_success and ok
 
-    for pr in reviewed_prs:
-        if pr.get('number') not in pending_numbers:
-            pr['_review_status'] = 'reviewed'
-            pr['_is_direct_request'] = False
-            pending_prs.append(pr)
+    if not all_success:
+        return [], False
 
     pending_prs.sort(key=lambda p: p.get('updatedAt', ''), reverse=True)
 
     results = []
     for pr in pending_prs:
+        repo = pr.get('_repo', {})
         check_runs = parse_status_check_rollup(pr.get('statusCheckRollup'))
         ci_symbol, ci_class, ci_url = get_ci_status_summary(check_runs)
 
@@ -443,11 +984,16 @@ def fetch_review_requests() -> tuple[list[dict], bool]:
                 'title': pr.get('title', ''),
                 'url': pr.get('url', ''),
                 'branch': pr.get('headRefName', ''),
+                'repo': repo.get('nwo', ''),
+                'repo_label': repo.get('name', ''),
+                'is_primary_repo': repo.get('primary', True),
+                'pr_key': make_pr_key(repo.get('nwo', ''), str(pr.get('number', ''))),
                 'author': author_login,
                 'isDraft': pr.get('isDraft', False),
                 'ci_symbol': ci_symbol,
                 'ci_class': ci_class,
                 'ci_url': ci_url,
+                'check_runs': check_runs,
                 'updated_at': updated_at,
                 'approvers': approvers,
                 'pending_reviewers': pending_reviewers,
@@ -455,13 +1001,119 @@ def fetch_review_requests() -> tuple[list[dict], bool]:
                 'review_status': pr.get('_review_status', 'pending'),
                 'is_direct_request': pr.get('_is_direct_request', True),
                 'user_approved': user_approved,
+                'details_stale': pr.get('_details_stale', False),
             }
         )
 
     return results, True
 
 
-def _parse_pr(pr: dict, current_user: str) -> dict | None:
+def _fetch_review_requests_for_repo(repo: dict, force: bool = False) -> tuple[list[dict], bool]:
+    """Fetch pending + already-reviewed PRs for one repo, tagged with review metadata."""
+    debug = os.environ.get('PR_DASH_DEBUG', os.environ.get('WORKTREES_DEBUG', '')).lower() in ('1', 'true', 'yes')
+    current_user = get_current_user()
+    nwo = repo['nwo']
+
+    pending_prs, pending_success = _fetch_pr_list(
+        [
+            'gh',
+            'pr',
+            'list',
+            '--repo',
+            nwo,
+            '--search',
+            'review-requested:@me',
+            '--state',
+            'open',
+            '--limit',
+            '100',
+            '--json',
+            _REVIEW_REQUEST_FIELDS_LIGHT,
+        ],
+        _METADATA_INTERVAL,
+        force=force,
+    )
+    if not pending_success:
+        pending_numbers, rest_success = _fetch_search_pr_numbers(nwo, f'is:pr is:open review-requested:{current_user}')
+        if rest_success:
+            with ThreadPoolExecutor(max_workers=_parallel_workers()) as executor:
+                pending_prs = [
+                    pr
+                    for pr in executor.map(
+                        _fetch_pr_details,
+                        [(nwo, number, _REVIEW_REQUEST_FIELDS_LIGHT) for number in pending_numbers],
+                    )
+                    if pr
+                ]
+            pending_success = len(pending_prs) == len(pending_numbers)
+            if debug:
+                print(f'[fetch] {nwo}: REST fallback found {len(pending_prs)} pending review requests')
+
+    reviewed_prs, reviewed_success = _fetch_pr_list(
+        [
+            'gh',
+            'pr',
+            'list',
+            '--repo',
+            nwo,
+            '--search',
+            'reviewed-by:@me -author:@me',
+            '--state',
+            'open',
+            '--limit',
+            '50',
+            '--json',
+            _REVIEW_REQUEST_FIELDS_LIGHT,
+        ],
+        _METADATA_INTERVAL,
+        force=force,
+    )
+    if not reviewed_success:
+        reviewed_numbers, rest_success = _fetch_search_pr_numbers(
+            nwo, f'is:pr is:open reviewed-by:{current_user} -author:{current_user}'
+        )
+        if rest_success:
+            with ThreadPoolExecutor(max_workers=_parallel_workers()) as executor:
+                reviewed_prs = [
+                    pr
+                    for pr in executor.map(
+                        _fetch_pr_details,
+                        [(nwo, number, _REVIEW_REQUEST_FIELDS_LIGHT) for number in reviewed_numbers],
+                    )
+                    if pr
+                ]
+            reviewed_success = len(reviewed_prs) == len(reviewed_numbers)
+            if debug:
+                print(f'[fetch] {nwo}: REST fallback found {len(reviewed_prs)} reviewed PRs')
+
+    if not pending_success or not reviewed_success:
+        return [], False
+
+    pending_numbers = {pr.get('number') for pr in pending_prs}
+    for pr in pending_prs:
+        is_direct = any(
+            (req.get('login') or '').lower() == current_user.lower()
+            for req in (pr.get('reviewRequests', []) or [])
+            if req
+        )
+        pr['_review_status'] = 'pending'
+        pr['_is_direct_request'] = is_direct
+        pr['_repo'] = repo
+
+    for pr in reviewed_prs:
+        if pr.get('number') not in pending_numbers:
+            pr['_review_status'] = 'reviewed'
+            pr['_is_direct_request'] = False
+            pr['_repo'] = repo
+            pending_prs.append(pr)
+
+    with ThreadPoolExecutor(max_workers=_parallel_workers()) as executor:
+        return list(
+            executor.map(lambda pr: _enrich_open_pr(nwo, pr, include_comments=False, force=force), pending_prs)
+        ), True
+
+
+def _parse_pr(pr: dict, current_user: str, repo: dict) -> dict | None:
     """Parse a single PR from gh CLI JSON output into internal format."""
     if not pr:
         return None
@@ -540,6 +1192,10 @@ def _parse_pr(pr: dict, current_user: str) -> dict | None:
 
     return {
         'number': pr.get('number'),
+        'repo': repo.get('nwo', ''),
+        'repo_label': repo.get('name', ''),
+        'is_primary_repo': repo.get('primary', True),
+        'pr_key': make_pr_key(repo.get('nwo', ''), str(pr.get('number', ''))),
         'title': pr.get('title', ''),
         'state': pr.get('state'),
         'isDraft': pr.get('isDraft', False),
@@ -549,6 +1205,7 @@ def _parse_pr(pr: dict, current_user: str) -> dict | None:
         'updatedAt': pr.get('updatedAt'),
         'createdAt': pr.get('createdAt'),
         'head_sha': pr.get('headRefOid'),
+        'details_stale': pr.get('_details_stale', False),
         'reviewDecision': pr.get('reviewDecision'),
         'last_push_at': None,
         'approvers': list(set(approvers)),
@@ -583,13 +1240,23 @@ def is_bot_user(username: str) -> bool:
         'snyk-bot',
         'copilot',
         'cursor',
+        'chatgpt-codex-connector',
+        'devin-ai-integration',
     }
+    # Org-specific review bots: PR_DASH_BOTS="acme-reviewer,acme-commenter"
+    extra = os.environ.get('PR_DASH_BOTS', '')
+    known_bots |= {b.strip().lower() for b in extra.split(',') if b.strip()}
     return username_lower in known_bots
 
 
-def get_worktrees() -> list[tuple[str, str]]:
-    """Get list of worktrees and their branches."""
-    success, output = run_command(['git', 'worktree', 'list', '--porcelain'])
+def get_worktrees(repo_path: str = '') -> list[tuple[str, str]]:
+    """Get list of worktrees and their branches for a repo checkout (default: cwd)."""
+    cmd = (
+        ['git', '-C', repo_path, 'worktree', 'list', '--porcelain']
+        if repo_path
+        else ['git', 'worktree', 'list', '--porcelain']
+    )
+    success, output = run_command(cmd)
     if not success:
         return []
 
@@ -964,12 +1631,22 @@ def parse_status_check_rollup(rollup: list[dict] | None) -> list[dict]:
             continue
         latest_by_name[name] = {
             'name': name,
+            'workflow_name': ctx.get('workflowName', ''),
             'status': (ctx.get('status') or '').lower(),
             'conclusion': (ctx.get('conclusion') or '').lower(),
             'html_url': ctx.get('detailsUrl', ''),
             'completed_at': completed_at,
         }
     return sorted(latest_by_name.values(), key=lambda x: x['name'])
+
+
+# The human-approval gate fails on every PR until a code owner approves, which is
+# expected and not an actionable CI failure — exclude it from the status summary.
+_APPROVAL_CHECK_WORKFLOW = 'pr_approval_check'
+
+
+def is_approval_check_run(cr: dict) -> bool:
+    return cr.get('workflow_name', '') == _APPROVAL_CHECK_WORKFLOW
 
 
 def get_ci_status_summary(check_runs: list[dict]) -> tuple[str, str, str | None]:
@@ -986,6 +1663,9 @@ def get_ci_status_summary(check_runs: list[dict]) -> tuple[str, str, str | None]
     all_success = True
 
     for cr in check_runs:
+        if is_approval_check_run(cr):
+            continue
+
         status = cr.get('status', '')
         conclusion = cr.get('conclusion', '')
 
@@ -1128,27 +1808,27 @@ def get_relative_path(worktree_path: str) -> str:
         return Path(worktree_path).name
 
 
-def fetch_worktree_data(
-    worktree: str | None, branch: str, display_path: str, repo_owner: str, repo_name: str, current_user: str
-) -> dict:
+def fetch_worktree_data(worktree: str | None, repo: dict, branch: str, display_path: str) -> dict:
     """Fetch all data for a worktree. Uses batch-fetched PR data from _pr_cache.
 
     Args:
         worktree: Path to the worktree, or None for virtual/deleted worktrees
+        repo: Repo entry from get_repos() that owns this branch
         branch: Branch name
         display_path: Path to display in the UI (may differ from worktree for virtual entries)
-        repo_owner: GitHub repo owner
-        repo_name: GitHub repo name
-        current_user: Current GitHub username
     """
     result = {
         'worktree': worktree,
         'worktree_display': display_path or '-',
         'branch': branch,
+        'repo': repo.get('nwo', ''),
+        'repo_label': repo.get('name', ''),
+        'is_primary_repo': repo.get('primary', True),
         'pr': None,
         'pr_url': '',
         'pr_title': '',
         'pr_number': '',
+        'pr_key': '',
         'status': 'no-pr',
         'status_label': 'No PR',
         'approvers': [],
@@ -1183,16 +1863,17 @@ def fetch_worktree_data(
 
     # Look up PR from batch-fetched cache (no API call needed)
     with _pr_cache_lock:
-        pr = _pr_cache.get(branch)
+        pr = _pr_cache.get(make_pr_key(repo.get('nwo', ''), branch))
 
     if pr:
         result['pr'] = pr
         result['pr_url'] = pr.get('url', '')
         result['pr_title'] = pr.get('title', '')
         result['pr_number'] = str(pr.get('number', ''))
+        result['pr_key'] = pr.get('pr_key', '')
         result['pr_updated_at'] = parse_timestamp(pr.get('updatedAt'))
 
-        pr_state = pr.get('state')
+        pr_state = (pr.get('state') or '').upper()
         is_draft = pr.get('isDraft', False)
         merged_at = pr.get('mergedAt')
 
@@ -1207,16 +1888,16 @@ def fetch_worktree_data(
 
         # Handle conflict status with caching for UNKNOWN responses
         pr_conflicts = pr.get('has_conflicts')
-        pr_number = str(pr.get('number', ''))
+        conflict_key = pr.get('pr_key') or make_pr_key(repo.get('nwo', ''), str(pr.get('number', '')))
         if pr_conflicts is None:
             # GitHub returned UNKNOWN - use cached value if available
             with _conflict_cache_lock:
-                result['has_conflicts'] = _conflict_cache.get(pr_number, False)
+                result['has_conflicts'] = _conflict_cache.get(conflict_key, False)
         else:
             # Definite answer from GitHub - update cache
             result['has_conflicts'] = pr_conflicts
             with _conflict_cache_lock:
-                _conflict_cache[pr_number] = pr_conflicts
+                _conflict_cache[conflict_key] = pr_conflicts
 
         if merged_at:
             result['status'] = 'merged'
@@ -1295,7 +1976,7 @@ def fetch_worktree_data(
     return result
 
 
-def refresh_cache():
+def refresh_cache(force: bool = False) -> None:
     """Refresh the PR data cache.
 
     GitHub PRs are the source of truth. Local worktrees enrich with dirty/unpushed status.
@@ -1306,15 +1987,13 @@ def refresh_cache():
         _cache['updating'] = True
 
     try:
-        repo_owner, repo_name = get_repo_info()
-        if not repo_owner or not repo_name:
+        repos = get_repos()
+        if not repos:
             return
 
-        current_user = get_current_user()
+        pr_data, fetch_success = fetch_user_prs(force=force)
 
-        pr_data, fetch_success = fetch_user_prs()
-
-        is_stale = False
+        is_stale = any(pr.get('details_stale') for pr in pr_data.values())
         if fetch_success and pr_data:
             with _pr_cache_lock:
                 _pr_cache.clear()
@@ -1332,41 +2011,51 @@ def refresh_cache():
             with _pr_cache_lock:
                 _pr_cache.clear()
 
-        worktree_map: dict[str, str] = {}
-        for wt_path, branch in get_worktrees():
-            if branch not in ('(bare)', '(detached)'):
-                worktree_map[branch] = wt_path
+        repos_by_nwo = {repo['nwo']: repo for repo in repos}
 
-        entries: list[tuple[str | None, str, str]] = []
-        for branch in pr_data:
-            wt_path = worktree_map.get(branch)
+        # Worktrees are per-checkout, so map them under the same repo#branch key as PRs.
+        worktree_map: dict[str, str] = {}
+        for repo in repos:
+            if not repo.get('path'):
+                continue
+            for wt_path, branch in get_worktrees(repo['path']):
+                if branch not in ('(bare)', '(detached)'):
+                    worktree_map[make_pr_key(repo['nwo'], branch)] = wt_path
+
+        entries: list[tuple[str | None, dict, str, str]] = []
+        for key, pr in pr_data.items():
+            repo = repos_by_nwo.get(pr.get('repo', ''))
+            if repo is None:
+                continue
+            branch = key.split('#', 1)[1] if '#' in key else key
+            wt_path = worktree_map.get(key)
             display_path = get_relative_path(wt_path) if wt_path else ''
-            entries.append((wt_path, branch, display_path))
+            entries.append((wt_path, repo, branch, display_path))
 
         results = []
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {
-                executor.submit(fetch_worktree_data, wt, br, display, repo_owner, repo_name, current_user): (
-                    wt,
-                    br,
-                    display,
-                )
-                for wt, br, display in entries
+                executor.submit(fetch_worktree_data, wt, repo, br, display): (wt, repo, br, display)
+                for wt, repo, br, display in entries
             }
             for future in as_completed(futures):
                 try:
                     results.append(future.result())
                 except Exception:
-                    wt, br, display = futures[future]
+                    wt, repo, br, display = futures[future]
                     results.append(
                         {
                             'worktree': wt,
                             'worktree_display': display,
                             'branch': br,
+                            'repo': repo.get('nwo', ''),
+                            'repo_label': repo.get('name', ''),
+                            'is_primary_repo': repo.get('primary', True),
                             'status': 'error',
                             'status_label': 'Error',
                             'pr_url': '',
                             'pr_title': '',
+                            'pr_key': '',
                             'approvers': [],
                             'pending_reviewers': [],
                             'commented_reviewers': [],
@@ -1387,12 +2076,13 @@ def refresh_cache():
 
         def sort_key(d):
             if d.get('pr_updated_at'):
-                return (-d['pr_updated_at'].timestamp(), d['branch'])
-            return (0.0, d['branch'])
+                return (-d['pr_updated_at'].timestamp(), d.get('repo', ''), d['branch'])
+            return (0.0, d.get('repo', ''), d['branch'])
 
         results.sort(key=sort_key)
 
-        review_requests, rr_success = fetch_review_requests()
+        review_requests, rr_success = fetch_review_requests(force=force)
+        is_stale = is_stale or not rr_success or any(pr.get('details_stale') for pr in review_requests)
 
         with _cache_lock:
             _cache['data'] = results
@@ -1405,32 +2095,52 @@ def refresh_cache():
             _cache['updating'] = False
 
 
-def background_refresh():
-    """Background thread that refreshes cache periodically."""
+def _note_activity() -> None:
+    """Wake the idle poller when a viewer returns, instead of waiting up to ten minutes."""
+    now = datetime.now(timezone.utc)
+    with _api_access_lock:
+        previous = _api_state['last_access']
+        _api_state['last_access'] = now
+    if previous is None or (now - previous).total_seconds() >= 120:
+        _refresh_wakeup.set()
+
+
+def _refresh_interval() -> int:
+    """Use the same refresh schedule for the poller and the browser countdown."""
+    with _cache_lock:
+        rows = _cache['data'] + _cache['review_requests']
+        has_errors = _cache['is_stale'] or any(d.get('status') == 'fetch-error' for d in rows)
+    if has_errors:
+        return _ACTIVE_CI_INTERVAL
+    with _api_access_lock:
+        last_access = _api_state['last_access']
+    if last_access and (datetime.now(timezone.utc) - last_access).total_seconds() < 120:
+        if any(
+            cr.get('status') in ('in_progress', 'queued') and not is_approval_check_run(cr)
+            for row in rows
+            for cr in row.get('check_runs', [])
+        ):
+            return _ACTIVE_CI_INTERVAL
+        return _METADATA_INTERVAL
+    return _CLOSED_LIST_INTERVAL
+
+
+def background_refresh() -> None:
+    """Refresh on the adaptive schedule, waking early when an idle viewer returns."""
     while True:
+        _refresh_wakeup.clear()
         try:
             refresh_cache()
         except Exception as e:
             print(f'Error refreshing cache: {e}')
 
-        # Adaptive refresh: fast when page is being viewed, slow when idle
-        with _cache_lock:
-            data = _cache['data']
-        has_errors = any(d.get('status') == 'fetch-error' for d in data)
-
-        # Check if anyone is viewing the page (API accessed in last 2 minutes)
-        with _api_access_lock:
-            last_access = _api_state['last_access']
-        is_active = last_access and (datetime.now(timezone.utc) - last_access).total_seconds() < 120
-
-        if has_errors:
-            sleep_time = 15  # Fast retry on errors
-        elif is_active:
-            sleep_time = 60  # 1 min when actively viewed
-        else:
-            sleep_time = 600  # 10 min when idle
-
-        time.sleep(sleep_time)
+        limited_until = rate_limited_until()
+        sleep_time = (
+            max(15.0, (limited_until - datetime.now(timezone.utc)).total_seconds())
+            if limited_until
+            else _refresh_interval()
+        )
+        _refresh_wakeup.wait(sleep_time)
 
 
 HTML_TEMPLATE = """
@@ -1893,6 +2603,15 @@ HTML_TEMPLATE = """
             border: 1px solid rgba(219, 109, 40, 0.3);
             font-size: 0.6rem;
             margin-left: 0.375rem;
+            cursor: default;
+        }
+
+        .badge-repo {
+            background: rgba(57, 197, 207, 0.12);
+            color: var(--accent-cyan);
+            border: 1px solid rgba(57, 197, 207, 0.3);
+            font-size: 0.6rem;
+            margin-right: 0.375rem;
             cursor: default;
         }
 
@@ -2549,10 +3268,10 @@ HTML_TEMPLATE = """
             }
         }
 
-        function setLastViewed(prNumber) {
-            if (!prNumber) return;
+        function setLastViewed(prKey) {
+            if (!prKey) return;
             const times = getLastViewedTimes();
-            times[prNumber] = new Date().toISOString();
+            times[prKey] = new Date().toISOString();
             try {
                 localStorage.setItem(VIEWED_STORAGE_KEY, JSON.stringify(times));
             } catch (e) {
@@ -2560,16 +3279,27 @@ HTML_TEMPLATE = """
             }
         }
 
+        function prKeyOf(row) {
+            // PR numbers repeat across repos, so track state by "owner/name#number".
+            return row && (row.pr_key || (row.pr_number ? String(row.pr_number) : ''));
+        }
+
+        function repoBadge(row) {
+            if (!row || !row.repo_label || row.is_primary_repo) return '';
+            return `<span class="badge badge-repo" title="${escapeHtml(row.repo || '')}">${escapeHtml(row.repo_label)}</span>`;
+        }
+
         function hasNewActivity(row) {
-            if (!row.pr_number || !row.last_comment_timestamp) return false;
+            const key = prKeyOf(row);
+            if (!key || !row.last_comment_timestamp) return false;
             const times = getLastViewedTimes();
-            const lastViewed = times[row.pr_number];
+            const lastViewed = times[key];
             if (!lastViewed) return false;  // Never viewed = no baseline, don't highlight
             return new Date(row.last_comment_timestamp) > new Date(lastViewed);
         }
 
-        function markPRViewed(prNumber, rowIndex) {
-            setLastViewed(prNumber);
+        function markPRViewed(prKey, rowIndex) {
+            setLastViewed(prKey);
             // Remove highlight from the row
             const row = document.getElementById(`main-${rowIndex}`);
             if (row) {
@@ -2596,21 +3326,21 @@ HTML_TEMPLATE = """
             } catch (e) { return new Set(); }
         }
 
-        function markReviewSeen(prNumber) {
-            if (!prNumber) return;
+        function markReviewSeen(prKey) {
+            if (!prKey) return;
             const seen = getSeenReviews();
-            seen.add(String(prNumber));
+            seen.add(String(prKey));
             try { localStorage.setItem(SEEN_REVIEWS_KEY, JSON.stringify([...seen])); } catch (e) { /* ignore */ }
         }
 
-        function isNewReview(prNumber) {
-            if (!prNumber) return false;
-            return !getSeenReviews().has(String(prNumber));
+        function isNewReview(prKey) {
+            if (!prKey) return false;
+            return !getSeenReviews().has(String(prKey));
         }
 
-        function cleanupSeenReviews(currentNumbers) {
+        function cleanupSeenReviews(currentKeys) {
             const seen = getSeenReviews();
-            const current = new Set(currentNumbers.map(String));
+            const current = new Set(currentKeys.map(String));
             const cleaned = new Set([...seen].filter(n => current.has(n)));
             try { localStorage.setItem(SEEN_REVIEWS_KEY, JSON.stringify([...cleaned])); } catch (e) { /* ignore */ }
         }
@@ -2735,7 +3465,7 @@ HTML_TEMPLATE = """
 
             const row = displayedData[selectedRowIndex];
             if (row && row.pr_url) {
-                markPRViewed(row.pr_number, selectedRowIndex);
+                markPRViewed(prKeyOf(row), selectedRowIndex);
                 window.open(row.pr_url, '_blank');
             }
         }
@@ -2955,6 +3685,7 @@ HTML_TEMPLATE = """
                 const searchableFields = [
                     row.worktree_display || '',
                     row.branch || '',
+                    row.repo || '',
                     row.pr_title || '',
                     row.status_label || '',
                     (row.approvers || []).join(' '),
@@ -3252,11 +3983,11 @@ HTML_TEMPLATE = """
                     : '';
                 const authorLogin = pr.author || '';
                 const authorShort = authorLogin.split('-')[0];
-                const reviewNewClass = isNewReview(pr.number) ? ' has-new-activity' : '';
+                const reviewNewClass = isNewReview(prKeyOf(pr)) ? ' has-new-activity' : '';
                 html += `<tr class="${reviewNewClass.trim()}">`;
                 html += `<td class="review-author">${authorLogin ? userPullsLink(authorLogin, escapeHtml(authorShort)) : escapeHtml(authorShort)}</td>`;
-                html += `<td class="branch copyable" onclick="copyToClipboard('${escapeHtml(pr.branch)}', this)">${escapeHtml(pr.branch)}</td>`;
-                html += `<td><div class="pr-title-wrapper"><a href="${escapeHtml(pr.url)}" target="_blank" class="pr-title" onclick="markReviewSeen('${pr.number}')">${escapeHtml(pr.title)}</a>${draftBadge}<span class="tooltip">${escapeHtml(pr.title)}</span></div></td>`;
+                html += `<td class="branch copyable" onclick="copyToClipboard('${escapeHtml(pr.branch)}', this)">${repoBadge(pr)}${escapeHtml(pr.branch)}</td>`;
+                html += `<td><div class="pr-title-wrapper"><a href="${escapeHtml(pr.url)}" target="_blank" class="pr-title" onclick="markReviewSeen('${escapeHtml(prKeyOf(pr))}')">${escapeHtml(pr.title)}</a>${draftBadge}<span class="tooltip">${escapeHtml(pr.title)}</span></div></td>`;
                 html += '<td class="ci-status">';
                 if (pr.ci_url) {
                     html += `<a href="${escapeHtml(pr.ci_url)}" target="_blank" class="ci-link ${pr.ci_class}"><span class="ci-icon">${pr.ci_symbol}</span></a>`;
@@ -3371,13 +4102,13 @@ HTML_TEMPLATE = """
                 }
                 html += `</span></td>`;
 
-                html += `<td class="branch copyable" onclick="copyToClipboard('${escapeHtml(row.branch)}', this)">${escapeHtml(row.branch)}</td>`;
+                html += `<td class="branch copyable" onclick="copyToClipboard('${escapeHtml(row.branch)}', this)">${repoBadge(row)}${escapeHtml(row.branch)}</td>`;
                 const conflictsBadge = row.has_conflicts ? '<span class="badge badge-conflicts" title="Has merge conflicts">⚠</span>' : '';
                 html += `<td><span class="status-badge status-${row.status}">${escapeHtml(row.status_label)}</span>${conflictsBadge}</td>`;
 
                 // PR Title with link and instant tooltip for full title (only shown if truncated)
                 if (row.pr_url) {
-                    html += `<td><div class="pr-title-wrapper"><a href="${escapeHtml(row.pr_url)}" target="_blank" class="pr-title" onclick="markPRViewed('${escapeHtml(row.pr_number)}', ${i})">${escapeHtml(row.pr_title)}</a><span class="tooltip">${escapeHtml(row.pr_title)}</span></div></td>`;
+                    html += `<td><div class="pr-title-wrapper"><a href="${escapeHtml(row.pr_url)}" target="_blank" class="pr-title" onclick="markPRViewed('${escapeHtml(prKeyOf(row))}', ${i})">${escapeHtml(row.pr_title)}</a><span class="tooltip">${escapeHtml(row.pr_title)}</span></div></td>`;
                 } else {
                     html += `<td></td>`;
                 }
@@ -3480,16 +4211,16 @@ HTML_TEMPLATE = """
 
                 // Detect new review requests and own-PR activity for notifications
                 const currentReviewNumbers = new Set(
-                    reviewRequestData.filter(r => r.review_status === 'pending').map(r => String(r.number))
+                    reviewRequestData.filter(r => r.review_status === 'pending').map(r => prKeyOf(r))
                 );
                 const currentGreenPRs = new Set(
-                    worktreeData.filter(r => hasNewActivity(r)).map(r => String(r.pr_number))
+                    worktreeData.filter(r => hasNewActivity(r)).map(r => prKeyOf(r))
                 );
 
                 if (!isFirstLoad) {
                     const newReviewNumbers = [...currentReviewNumbers].filter(n => !previousReviewNumbers.has(n));
                     if (newReviewNumbers.length > 0) {
-                        const newPRs = reviewRequestData.filter(r => newReviewNumbers.includes(String(r.number)));
+                        const newPRs = reviewRequestData.filter(r => newReviewNumbers.includes(prKeyOf(r)));
                         sendNotification(
                             `${newPRs.length} new review request${newPRs.length > 1 ? 's' : ''}`,
                             newPRs.map(p => `${p.author}: ${p.title}`).join('\\n')
@@ -3497,7 +4228,7 @@ HTML_TEMPLATE = """
                     }
                     const newlyGreen = [...currentGreenPRs].filter(n => !previousGreenPRs.has(n));
                     if (newlyGreen.length > 0) {
-                        const greenRows = worktreeData.filter(r => newlyGreen.includes(String(r.pr_number)));
+                        const greenRows = worktreeData.filter(r => newlyGreen.includes(prKeyOf(r)));
                         sendNotification(
                             `${greenRows.length} PR${greenRows.length > 1 ? 's' : ''} updated`,
                             greenRows.map(p => `${p.branch}: ${p.last_comment || 'new activity'}`).join('\\n')
@@ -3557,7 +4288,12 @@ HTML_TEMPLATE = """
                 indicator.classList.toggle('is-stale', result.is_stale);
 
                 // Show error/stale state in header
-                if (result.is_stale) {
+                if (result.rate_limited_until) {
+                    const resumeAt = new Date(result.rate_limited_until).toLocaleTimeString();
+                    indicator.classList.remove('has-errors');
+                    indicator.classList.add('is-stale');
+                    indicator.title = `GitHub rate limit hit - showing cached data, resuming at ${resumeAt}`;
+                } else if (result.is_stale) {
                     indicator.classList.remove('has-errors');
                     indicator.classList.add('is-stale');
                     indicator.title = 'GitHub API failed - showing cached data. Click to retry.';
@@ -3738,9 +4474,7 @@ def index():
 
 @app.route('/api/worktrees')
 def api_worktrees():
-    # Track access time for adaptive refresh rate
-    with _api_access_lock:
-        _api_state['last_access'] = datetime.now(timezone.utc)
+    _note_activity()
 
     with _cache_lock:
         data = _cache['data']
@@ -3752,19 +4486,12 @@ def api_worktrees():
     # Check if any entries have fetch errors
     has_errors = any(d.get('status') == 'fetch-error' for d in data) or is_stale
 
-    # Adaptive refresh: fast when active, slow when idle
-    with _api_access_lock:
-        last_access = _api_state['last_access']
-    is_active = last_access and (datetime.now(timezone.utc) - last_access).total_seconds() < 120
-
-    if has_errors:
-        refresh_interval = 15
-    elif is_active:
-        refresh_interval = 60  # 1 min when actively viewed
-    else:
-        refresh_interval = 600  # 10 min when idle
+    limited_until = rate_limited_until()
+    refresh_interval = _refresh_interval()
     next_refresh = None
-    if last_updated:
+    if limited_until:
+        next_refresh = limited_until
+    elif last_updated:
         next_refresh = last_updated + timedelta(seconds=refresh_interval)
 
     # Serialize datetime objects
@@ -3786,6 +4513,7 @@ def api_worktrees():
             'updating': updating,
             'has_errors': has_errors,
             'is_stale': is_stale,
+            'rate_limited_until': limited_until.isoformat() if limited_until else None,
         }
     )
 
@@ -3814,15 +4542,19 @@ def api_refresh():
     if already_updating:
         return jsonify({'status': 'refresh already in progress'})
 
-    threading.Thread(target=refresh_cache, daemon=True).start()
+    # A click is a deliberate probe: lift the cooldown. If GitHub is still over quota the first
+    # call re-arms it and the rest of the cycle short-circuits, so the probe costs one request.
+    with _rate_limit_lock:
+        _rate_limit_state['until'] = None
+
+    threading.Thread(target=refresh_cache, kwargs={'force': True}, daemon=True).start()
     return jsonify({'status': 'refresh started'})
 
 
 @app.route('/api/heartbeat', methods=['POST'])
 def api_heartbeat():
     """Heartbeat from frontend indicating page is actively being viewed."""
-    with _api_access_lock:
-        _api_state['last_access'] = datetime.now(timezone.utc)
+    _note_activity()
 
     return jsonify({'status': 'ok'})
 
