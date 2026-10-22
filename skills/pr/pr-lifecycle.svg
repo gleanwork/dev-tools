@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1300 730" width="1300" height="730" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<defs><marker id="ah-flow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2f6bff"/></marker><marker id="ah-raise" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#e08a00"/></marker><marker id="ah-focus" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1f9d5a"/></marker><marker id="ah-fix" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7a4dd6"/></marker><marker id="ah-merge" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2249a"/></marker><marker id="ah-park" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b7791f"/></marker><marker id="ah-clean" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0f766e"/></marker><filter id="sh" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#141822" flood-opacity="0.10"/></filter></defs>
+<path d="M205,104 L290,135" fill="none" stroke="#2f6bff" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-flow)"/>
+<path d="M360,205 L360,320 L400,320 L400,380" fill="none" stroke="#2f6bff" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-flow)"/>
+<path d="M430,135 Q485,135 534,190" fill="none" stroke="#2f6bff" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-flow)"/>
+<path d="M620,276 Q570,340 520,380" fill="none" stroke="#2f6bff" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-flow)"/>
+<path d="M706,190 Q820,250 915,380" fill="none" stroke="#b7791f" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-park)"/>
+<path d="M550,405 Q705,375 860,405" fill="none" stroke="#b7791f" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-park)"/>
+<path d="M300,448 C230,430 230,510 300,492" fill="none" stroke="#e08a00" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-raise)"/>
+<path d="M860,448 C790,430 790,510 860,492" fill="none" stroke="#e08a00" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-raise)"/>
+
+<path d="M965,380 L965,42 L360,42 L360,63" fill="none" stroke="#1f9d5a" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-focus)"/>
+<path d="M1070,448 C1146,432 1146,512 1070,496" fill="none" stroke="#7a4dd6" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-fix)"/>
+<path d="M965,540 L965,665 L860,665" fill="none" stroke="#c2249a" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-merge)"/>
+<path d="M550,500 C580,530 590,590 610,665" fill="none" stroke="#c2249a" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-merge)"/>
+<path d="M610,688 L436,688" fill="none" stroke="#0f766e" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#ah-clean)"/>
+<rect x="868" y="394" width="210" height="160" rx="14" fill="rgba(224,138,0,0.08)" stroke="#e08a00" stroke-width="1.5" opacity="0.20"/>
+<rect x="868" y="387" width="210" height="160" rx="14" fill="rgba(224,138,0,0.08)" stroke="#e08a00" stroke-width="1.5" opacity="0.35"/>
+<rect x="40" y="75" width="165" height="58" rx="29" ry="29" fill="#ffffff" stroke="#2f6bff" stroke-width="1.5" filter="url(#sh)"/>
+<text x="122" y="101" font-size="14" fill="#17181c" font-weight="650" text-anchor="middle">start pr</text>
+<text x="122" y="120" font-size="12" fill="#5c6270" font-weight="400" text-anchor="middle">start or continue PR</text>
+<polygon points="360,63 432,135 360,207 288,135" fill="#ffffff" fill-opacity="0.92" stroke="#2f6bff" stroke-width="2"/>
+<text x="360" y="130" font-size="13" fill="#17181c" font-weight="650" text-anchor="middle">Primary checkout</text>
+<text x="360" y="148" font-size="13" fill="#17181c" font-weight="650" text-anchor="middle">clean?</text>
+<polygon points="620,104 706,190 620,276 534,190" fill="#ffffff" fill-opacity="0.92" stroke="#2f6bff" stroke-width="2"/>
+<text x="620" y="188" font-size="13" fill="#17181c" font-weight="650" text-anchor="middle">Preserve existing work?</text>
+<text x="620" y="207" font-size="11" fill="#5c6270" font-weight="400" text-anchor="middle">check PR state first</text>
+<rect x="300" y="380" width="250" height="160" rx="14" ry="14" fill="#ffffff" fill-opacity="0.92" stroke="#2f6bff" stroke-width="2" filter="url(#sh)"/>
+<text x="425" y="414" font-size="11" fill="#2f6bff" font-weight="700" text-anchor="middle">PRIMARY CHECKOUT</text>
+<text x="425" y="440" font-size="19" fill="#17181c" font-weight="650" text-anchor="middle">Primary checkout</text>
+<text x="425" y="469" font-size="12" fill="#5c6270" font-weight="400" text-anchor="middle">the center — normally holds</text>
+<text x="425" y="486" font-size="12" fill="#5c6270" font-weight="400" text-anchor="middle">the configured base branch</text>
+<rect x="860" y="380" width="210" height="160" rx="14" ry="14" fill="#ffffff" fill-opacity="0.92" stroke="#e08a00" stroke-width="2" filter="url(#sh)"/>
+<text x="965" y="414" font-size="14" fill="#17181c" font-weight="650" text-anchor="middle">Managed worktree</text>
+<text x="965" y="442" font-size="12" fill="#5c6270" font-weight="400" text-anchor="middle">Host-managed; a detached one is</text>
+<text x="965" y="459" font-size="12" fill="#5c6270" font-weight="400" text-anchor="middle">reused, else a new one</text>
+<text x="965" y="476" font-size="12" fill="#5c6270" font-weight="400" text-anchor="middle">is created</text>
+<text x="965" y="510" font-size="11" fill="#5c6270" font-weight="400" text-anchor="middle">closed PR: leave branch ref</text>
+<rect x="610" y="620" width="250" height="90" rx="14" ry="14" fill="#ffffff" fill-opacity="0.92" stroke="#c2249a" stroke-width="2" filter="url(#sh)"/>
+<text x="735" y="656" font-size="14" fill="#17181c" font-weight="650" text-anchor="middle">Shipped</text>
+<text x="735" y="676" font-size="12" fill="#5c6270" font-weight="400" text-anchor="middle">merged; managed worktree deleted</text>
+<rect x="180" y="652" width="254" height="72" rx="14" ry="14" fill="#ffffff" fill-opacity="0.92" stroke="#0f766e" stroke-width="2" filter="url(#sh)"/>
+<text x="307" y="678" font-size="14" fill="#0f766e" font-weight="650" text-anchor="middle">clean pr</text>
+<text x="307" y="697" font-size="12" fill="#5c6270" font-weight="400" text-anchor="middle">reclaim finished checkouts</text>
+<text x="307" y="713" font-size="11" fill="#5c6270" font-weight="400" text-anchor="middle">merged or closed · branches kept</text>
+<rect x="273.6" y="275.0" width="118.7" height="19" rx="6" fill="#f7f8fa"/>
+<text x="333" y="288.0" font-size="12" fill="#17181c" font-weight="400" text-anchor="middle">clean</text>
+<rect x="456.0" y="145.0" width="48.0" height="19" rx="6" fill="#f7f8fa"/>
+<text x="480" y="158.0" font-size="12" fill="#17181c" font-weight="400" text-anchor="middle">dirty</text>
+<rect x="535.0" y="292.0" width="130.0" height="19" rx="6" fill="#f7f8fa"/>
+<text x="600" y="305.0" font-size="12" fill="#17181c" font-weight="400" text-anchor="middle">commit or stash</text>
+<text x="600" y="321.0" font-size="11" fill="#5c6270" font-weight="400" text-anchor="middle">then raise or park if unraised</text>
+<rect x="705.0" y="238.0" width="170.0" height="19" rx="6" fill="#f7f8fa"/>
+<text x="790" y="251.0" font-size="12" fill="#17181c" font-weight="400" text-anchor="middle">or build in a worktree</text>
+<rect x="620.7" y="388.0" width="168.6" height="34" rx="6" fill="#f7f8fa"/>
+<text x="705" y="401.0" font-size="12" fill="#b7791f" font-weight="650" text-anchor="middle">park pr</text>
+<text x="705" y="416.0" font-size="11" fill="#5c6270" font-weight="500" text-anchor="middle">move out · free primary</text>
+<rect x="160.0" y="455.0" width="100.0" height="19" rx="6" fill="#f7f8fa"/>
+<text x="210" y="468.0" font-size="12" fill="#e08a00" font-weight="650" text-anchor="middle">raise pr</text>
+<rect x="720.0" y="455.0" width="100.0" height="19" rx="6" fill="#f7f8fa"/>
+<text x="770" y="468.0" font-size="12" fill="#e08a00" font-weight="650" text-anchor="middle">raise pr</text>
+<rect x="565.0" y="24.0" width="185.0" height="34" rx="6" fill="#f7f8fa"/>
+<text x="657" y="37.0" font-size="12" fill="#1f9d5a" font-weight="650" text-anchor="middle">focus pr</text>
+<text x="657" y="52.0" font-size="11" fill="#5c6270" font-weight="500" text-anchor="middle">commit or stash · move into primary</text>
+<rect x="1100.3" y="455.0" width="143.4" height="34" rx="6" fill="#f7f8fa"/>
+<text x="1172" y="468.0" font-size="12" fill="#7a4dd6" font-weight="650" text-anchor="middle">fix pr</text>
+<text x="1172" y="483.0" font-size="11" fill="#5c6270" font-weight="500" text-anchor="middle">rebase · resolve · test</text>
+<rect x="862.0" y="640.0" width="100.0" height="19" rx="6" fill="#f7f8fa"/>
+<text x="912" y="653.0" font-size="12" fill="#17181c" font-weight="400" text-anchor="middle">merge</text>
+<rect x="555.0" y="555.0" width="100.0" height="19" rx="6" fill="#f7f8fa"/>
+<text x="605" y="568.0" font-size="12" fill="#17181c" font-weight="400" text-anchor="middle">merge</text>
+<rect x="40" y="180" width="165" height="52" rx="10" fill="#f7f8fa"/>
+<text x="122.5" y="201" font-size="12" fill="#0f766e" font-weight="650" text-anchor="middle">ls pr</text>
+<text x="122.5" y="218" font-size="11" fill="#5c6270" font-weight="500" text-anchor="middle">inspect only</text>
+</svg>
