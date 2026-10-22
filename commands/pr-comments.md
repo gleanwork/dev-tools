@@ -68,9 +68,21 @@ For each nontrivial comment/resolution:
 gh api repos/$REPO/pulls/$PR_NUMBER/comments/$COMMENT_ID/replies -X POST -f body="done"
 ```
 
+### Human vs bot reviewers
+
+Always draft a reply, get approval on the exact text, then post it. Drafting and confirming is not auto-replying; skipping the reply is wrong.
+
+**On a "never auto-reply to human code review comments" rule** (many teams have one: "It is plain rude. Human-to-human is required... It is okay if you are asked to reply explicitly"): it forbids posting a reply to a human on your own — deciding a reply and posting it without the user approving it. It does not forbid posting after approval; the per-comment `yes` is that explicit ask. Once approved, posting is **required**; don't leave it unposted or re-ask.
+
+The rule's deeper concern is rudeness: a bot intruding on human-to-human review discourse. Approval makes the human the author — so the reply must read as words *they'd* type, not as an AI. A verbose, AI-sounding reply is rude even when approved. Keep it human (see Reply style).
+
+**Approve the exact text you post.** If the user edits the draft (e.g., "make it more concise"), that's a NEW draft — show it and reconfirm; an edit instruction is not approval to post the edited version. A blanket "post all the replies" is valid standing approval.
+
+**Why drafting is better, not a shortcut:** you just made the fix, so you hold the precise context — files, lines, reasoning. A reply you draft for the user to approve or rewrite beats one they reconstruct from partial memory or the screen; refusing to draft just forces a vaguer hand-typed reply.
+
 ### Reply style
 
-All lowercase, brief. No explanation needed if done as requested.
+All lowercase, brief, human. Write what the approving human would type, not an AI: no sycophancy ("great catch!"), no restating the reviewer's point back to them, no explanation when done as asked. If it doesn't read like a terse human dev, it's wrong — even after approval.
 
 - `done` - fix applied as requested (most common)
 - `done - <short note>` - with minor clarification
