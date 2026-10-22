@@ -2,6 +2,12 @@
 
 Markdown command files for AI coding agents (Cursor, Claude Code). Each file describes a workflow the agent executes when you invoke the corresponding slash command.
 
+> **Legacy format.** These are slash commands: one file per command, invoked explicitly. The newer
+> [`skills/pr/`](../skills/pr/) covers the same PR lifecycle (and more: parallel branches in sparse
+> worktrees, `fix all`, stacked PRs) in the cross-tool `SKILL.md` format that agents load on demand.
+> Prefer the skill for new installs; the commands remain for Cursor and for anyone who wants explicit
+> `/pr ...` entry points. `git-mergetool` has no skill equivalent and stays here.
+
 ## Installation
 
 Copy into your project's command directory:
@@ -24,12 +30,15 @@ Create  ──→  Review  ──→  Fix CI  ──→  Address Comments  ─�
 
 [`pr.md`](pr.md) is the router — it dispatches to the appropriate subcommand based on your input.
 
-### `/pr create [--here|--wt] [args...]`
+### `/pr create [--here|--wt] [--drop] [--no-greenify] [args...]`
 
 Cherry-pick commits into a clean branch, push, and open a PR. Supports three modes:
 - **Default**: cherry-pick onto a fresh `origin/master` branch
 - **`--wt`**: same, but in a temporary worktree (main checkout untouched)
 - **`--here`**: push the current branch as-is
+
+After creation it babysits the PR until CI is green and bot comments are resolved (`--no-greenify`
+skips this). `--drop` removes the cherry-picked commits from the source branch once the PR is up.
 
 ### `/pr review [pr_number] [-i]`
 

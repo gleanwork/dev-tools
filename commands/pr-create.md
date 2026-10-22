@@ -1,6 +1,6 @@
 # /pr create — cherry-pick to PR
 
-Usage: `/pr create [--here|--wt] [args...]` where each arg is either a commit hash or a reviewer name
+Usage: `/pr create [--here|--wt] [--drop] [--no-greenify] [args...]` where each arg is either a commit hash or a reviewer name
 
 Goal: create a clean PR branch off master from cherry-picked commits, run checks, and open a draft PR. No confirm, just do when steps are unambiguous. Pause on cherry-pick conflicts or ambiguous reviewer matches.
 
@@ -19,12 +19,24 @@ Goal: create a clean PR branch off master from cherry-picked commits, run checks
 
 ### `--wt` constraints
 - `--here` and `--wt` are **mutually exclusive** — error out if both specified.
+- Prefer `--wt` when the commits live on a working branch you want to keep clean — it replaces the manual "cd to another worktree, cherry-pick, babysit, reset the worktree back" dance in one command (often paired with `--drop`).
+
+### `--drop`
+- After the PR is successfully created (and greenified, if applicable), remove the cherry-picked commits from their source branch so they live only on the PR branch.
+- Only valid when the picked commits are the tip of the source branch (`HEAD`, or `HEAD~N..HEAD`); otherwise error out — rewriting mid-history is out of scope.
+- Incompatible with `--here` (there is no separate source branch).
+- Without the explicit flag, never reset the source branch. With the flag, the user has pre-authorized the `git reset --hard`.
+
+### `--no-greenify`
+- Greenify runs by default after every PR creation. Pass `--no-greenify` to skip it (fire-and-forget).
 
 ## Argument parsing
 
 Classify each arg by shape, not position:
 - `--here` → enable direct mode
 - `--wt` → enable worktree mode
+- `--drop` → drop cherry-picked commits from the source branch after success
+- `--no-greenify` → skip the post-create babysit loop
 - Hex-only string (7-40 chars, `^[0-9a-f]{7,40}$`) → commit hash candidate. Validate with `git rev-parse --verify`; if it fails, reclassify as a reviewer name
 - Everything else → reviewer name (first name, last name, or GitHub handle substring)
 - No args at all → cherry-pick `HEAD`, no reviewers
@@ -82,6 +94,12 @@ Skip this entire step in direct mode.
 - Never `--no-verify`
 - Changed files: `git diff --name-only origin/master...HEAD`
 
+### Style guide check
+- Apply language style guides to **changed lines only** — never touch unchanged code
+- Follow your project's language style guides (e.g. a Go conventions rule file) where they exist
+- Otherwise rely on precommit/linters plus the always-applied workspace rules (no trivial comments, naming conventions, etc.)
+- Amend fixes into the picked commits (they haven't been pushed yet) so the PR opens clean
+
 ## 5. Push and create PR
 
 - In `--wt` mode: working directory is `../<slug>`
@@ -89,11 +107,27 @@ Skip this entire step in direct mode.
 - Base the PR description on the cherry-picked commit message(s) and the diff
 - Single commit: use its subject as the title, its body as the description seed
 - Multiple commits: synthesize a title, list each commit's purpose
-- Follow your project's PR template and conventions
+- Follow your project's PR template and conventions exactly
 - If no reviewers: create as `--draft`
 - If reviewers provided: create as ready for review with `--reviewer <handle1>,<handle2>,...`
 
-## 6. Worktree cleanup (`--wt` only)
+## 6. Greenify (post-create babysit)
+
+Runs by default; skipped only with `--no-greenify`. Babysit the PR until it is green:
+
+- Sleep-poll the PR (≥3 min intervals, sized to expected CI runtime; shorter early when quick failures are likely)
+- Autofix CI failures; address bot reviewer comments — resolve them either way, explaining what was chosen or why not
+- Commit fixes normally (precommit autofix loop from step 4 — never `--no-verify`), push, re-check
+- Done when: no pending CI checks, all checks green, no new bot comments. Reject repeat-round bot nits not introduced by recent commits, with explanation
+
+## 7. Drop from source branch (`--drop` only)
+
+- Only after the PR is created (and green, if greenified) — the commits must safely exist on origin first
+- Verify the picked commits are still the tip of the source branch (someone may have committed since): `git log --format=%H -n <N> <source-branch>` must match the picked hashes. If not, stop and tell the user
+- On the source branch: `git reset --hard HEAD~<N>` (in the main checkout; switch back to the source branch first if needed)
+- Confirm to the user what was dropped and that it lives on the PR branch
+
+## 8. Worktree cleanup (`--wt` only)
 
 Skip in default and direct modes.
 
@@ -109,6 +143,7 @@ Skip in default and direct modes.
 /pr create 436d191d202f elijah         # cherry-pick specific commit + reviewer → ready-for-review PR
 /pr create --wt                        # cherry-pick HEAD via worktree → draft PR (main checkout untouched)
 /pr create --wt 436d191d202f elijah    # cherry-pick in worktree + reviewer → ready-for-review PR
+/pr create --wt --drop elijah          # cherry-pick HEAD in worktree, greenify, then drop HEAD from source branch
 /pr create --here                      # push current branch as-is → draft PR (no branch/worktree)
 /pr create --here elijah chak          # push current branch + reviewer(s) → ready-for-review PR
 /pr create --here 436d191d202f         # ERROR: commit hashes incompatible with --here

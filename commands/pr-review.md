@@ -27,9 +27,13 @@ Flow is always: analyze → present findings → **stop and wait for user respon
 ```bash
 gh pr view $PR_NUMBER --json headRefName,baseRefName,author,title,url
 gh pr diff $PR_NUMBER  # full diff, not just --stat
+# existing inline comments, so a re-run doesn't repeat itself (MUST paginate)
+gh api --paginate repos/$OWNER/$REPO/pulls/$PR_NUMBER/comments --jq '.[] | {path, line, user: .user.login, body}'
 ```
 
 Read the full diff and all changed files upfront in parallel so everything is in context.
+
+**Dedup against what's already posted.** Load the existing inline comments and, during the verification pass, drop any finding that an existing comment already covers, same or equivalent, even at a nearby line or in a different file that describes the same underlying issue. Re-runs are common; the review is only useful if it surfaces what's *not* already on the PR. If everything you found is already covered, say so plainly instead of re-listing it.
 
 ### Step 2: Review Style
 
@@ -87,7 +91,7 @@ Present files changed, **ordered for understanding** (not alphabetically):
 | # | File | Why this order |
 |---|------|----------------|
 | 1 | api.proto | Defines new message types |
-| 2 | handler.py | Core logic change |
+| 2 | transcription.py | Core logic change |
 | 3 | test_transcription.py | Tests the core |
 ```
 
@@ -112,6 +116,7 @@ Use a two-pass review so output is coherent for humans and easy to act on:
    - Re-read the actual code for every drafted comment and confirm the claim is true at the cited line. Reject anything based on a misread, stale assumption, or pattern-matched guess.
    - Check the surrounding context — a "missing" guard/check/cleanup may already exist elsewhere in the function, caller, or framework.
    - Drop anything that is not both **valid** (factually correct against the code) and **significant** (worth a reviewer's attention). Style nits with no real impact, speculative concerns, and "consider whether..." musings get cut.
+   - Drop anything an existing PR comment already covers (see Step 1 dedup). Same-or-equivalent findings, even at a nearby line, don't get re-surfaced.
    - If a finding survives but you are not fully confident, either downgrade it to a question or drop it. Better to under-report than to post wrong/noisy comments.
 4. **Present results in this order:**
    - `Simple-English PR understanding` (2-4 lines)
@@ -203,14 +208,14 @@ Keep this focused; avoid repeating every line-level finding.
 
 ### 6. Interactive Comment Posting (someone else's PR only)
 
-After each file, if issues were found, show each finding with its category, then the **draft comment** underneath. The draft is what actually gets posted — it must be natural, concise human language with no emoji tags or category prefixes:
+After each file, if issues were found, show each finding on two lines: the emoji tag with `file:line`, then the **comment** as a blockquote on the next line (the exact text that gets posted, plain first-person, self-contained, see Comment Style). No `Comment:`/`Why:` labels; the emoji tag is for triage only and never goes in the posted comment:
 
 ```
-🔴 **Must-fix** @ `file.py:42`: missing null check before deref
-> draft: `itemId` can be nil here when the delta has no payload — add a guard
+🔴 `file.py:42`
+> `itemId` can be nil here when the delta has no payload and this derefs it, add a guard.
 
-🟡 **Skippable** @ `file.py:78`: could add a test for the empty-list edge case
-> draft: nit: empty-list path is untested
+🟡 `file.py:78`
+> nit: the empty-list path isn't covered by a test.
 
 Post these? (yes / modify / skip individual)
 ```
@@ -225,7 +230,10 @@ Review all files silently, then present a single categorized summary.
 
 ### Findings Report
 
-Show findings categorized with emoji tags for the user's triage. Each finding also has a **draft comment** — this is what actually gets posted to the PR and must be natural, concise human language with no emoji tags or category prefixes.
+Present findings as a **full-width list**, not a table (tables squeeze the text into narrow columns and hurt readability). Group by emoji tag for triage. Each finding is just two lines, with **no labels**:
+
+1. `N. \`file:line\`` (bold) — the number lets the user say "skip N"
+2. the **comment** as a blockquote (`>`) on the next line: the exact text that gets posted to the PR, plain first-person (see Comment Style). The blockquote indents it under the location. There is no separate explanation line, so the comment itself must carry enough context to stand alone (what's wrong and why it matters), while staying to one or two sentences.
 
 ```
 ## Review: [PR title]
@@ -234,23 +242,27 @@ Show findings categorized with emoji tags for the user's triage. Each finding al
 [2-4 lines: what this PR does and why, in plain English]
 
 ### 🔴 Must-fix
-| # | File:Line | Issue | Draft comment |
-|---|-----------|-------|---------------|
-| 1 | `core.py:42` | Missing null check — `itemId` can be nil on empty deltas | `itemId` can be nil on empty deltas — add a nil guard |
-| 2 | `cache.py:18` | Race: concurrent calls overwrite `_pending` without lock | concurrent calls can overwrite `_pending` — needs a lock |
+
+**1. `core.py:42`**
+> `itemId` can be nil on empty deltas and this path derefs it in prod, add a nil guard.
+
+**2. `cache.py:18`**
+> concurrent calls overwrite `_pending` without a lock here, so a queued item silently disappears.
 
 ### 🟡 Skippable
-| # | File:Line | Issue | Draft comment |
-|---|-----------|-------|---------------|
-| 1 | `core.py:90` | Could add a test for the timeout path | nit: timeout path is untested |
-| 2 | `helper.ts:15` | Intermediate var `tmp` could be inlined | nit: `tmp` could be inlined |
+
+**1. `core.py:90`**
+> nit: the timeout path isn't covered by a test, easy to regress.
+
+**2. `helper.ts:15`**
+> nit: single-use `tmp` could be inlined.
 
 ### ✅ No issues
 - `proto/api.proto`
-- `test_handler.py`
+- `test_transcription.py`
 ```
 
-If **no code-level issues found**, note that in place of the 🔴/🟡 tables and proceed to the Deep Analysis section below.
+If **no code-level issues found**, note that in place of the 🔴/🟡 lists and proceed to the Deep Analysis section below.
 
 ### Required Deep Analysis Section (after categorized findings)
 
@@ -288,22 +300,27 @@ Post these as inline review comments? You can:
 
 **Review output** (shown to the user) uses 🔴/🟡/✅ tags and category labels for quick triage.
 
-**Draft comments** (posted to the PR) must be completely different — natural, concise human language. No emoji prefixes, no "must-fix:"/"skippable:" tags. Write like a colleague leaving a review:
+**Comments** (posted to the PR) are completely different. Write them exactly as the user would type them: plain, concise, first-person. No emoji prefixes, no "must-fix:"/"skippable:" tags. Sound like the user leaving a quick review, not an AI.
 
-- **Concise**: one or two sentences max. No essays. No "consider whether you might want to think about..."
-- **Actionable**: say what's wrong and what to do, or flag it as a question
-- **Human**: severity is obvious from word choice and context, not from tags
+- **Self-contained**: there is no separate explanation line, so the comment carries its own context, both what's wrong and why it matters, in one or two sentences. No essays, no "consider whether you might want to think about..."
+- **No em-dashes**: never use `—`. Use a comma, period, or "so"/"but" instead. Em-dashes read as AI-written.
+- **Actionable**: say what's wrong and what to do, or ask it as a question ("Can we ...?").
+- **Plain**: severity comes from word choice and context, not from tags or hedging.
+- **Lead with the problem, not the internals**: open with the plain-English symptom, then name at most one code symbol if it helps locate the fix. Don't stack `#privateField`/`ClassName.method` references up front, it reads arcane. If a comment needs three clauses to land, it's too long, cut it.
 
 Good:
-> `itemId` can be nil here — add a nil guard before the deref
+> `itemId` can be nil here, add a nil guard before the deref.
+
+Good (question):
+> Can we default to system default when the id isn't found? Right now it renders blank.
 
 Good (nit):
-> nit: this intermediate variable could be inlined
+> nit: this intermediate variable could be inlined.
 
-Bad:
+Bad (em-dash + tag):
 > 🔴 must-fix: `itemId` can be nil here — add a nil guard before the deref
 
-Bad:
+Bad (verbose, AI-sounding):
 > I noticed that in this section of the code, the variable `itemId` is being used without first checking whether it might be nil. This could potentially lead to a nil pointer dereference in production if the delta happens to arrive without a payload. It would be advisable to add a guard check before this line to ensure...
 
 ## Comment Placement (use only after user approves)
@@ -367,7 +384,7 @@ Don't just explain — actively look for problems:
 
 - **Concise over verbose** — short, direct comments. No filler.
 - **Verify before showing** — every finding must be fact-checked against the actual code. Only surface comments that are both valid and significant; drop the rest silently.
-- **Two voices** — use 🔴/🟡/✅ tags in review output for the user; draft comments posted to the PR are natural human language, no tags
+- **Two voices** — use 🔴/🟡/✅ tags in review output for the user; comments posted to the PR are plain first-person human language, no tags and no em-dashes
 - **NEVER post without approval** — always confirm first
 - **Always inline** — never PR-level comments, always find the right line
 - **Explain the why**, not just the what
