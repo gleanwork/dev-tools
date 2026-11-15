@@ -51,6 +51,11 @@
 #               - Misc: uv cache, bazel java logs, git temp packs
 #               - Git: worktree prune, remove prunable worktrees (refuses if dirty),
 #                 git gc (default prune window — keeps reflog recovery for ~2 weeks)
+              - Worktree files: share linked worktrees' tracked files with the main
+                checkout as APFS clones (skips worktrees in use)
+#               - Worktree files: tracked files in linked worktrees that match the
+#                 main checkout become APFS clones sharing its disk blocks (skips
+#                 worktrees a running process works in)
 #               - All linked-worktree Bazel output bases (preserves every repository's
 #                 main output base and the shared disk cache)
 #               - Bazel output bases left by an interrupted
@@ -1214,6 +1219,42 @@ while IFS= read -r repo; do
     ((items_deleted++))
   fi
 done <<<"$PRIMARY_WORKTREES"
+
+# Every linked worktree holds its own copy of each tracked file. On APFS,
+# replace the copies that match the main checkout with clones that share its
+# disk blocks (see clone-worktree-files.py next to this script). Worktrees a
+# running process works in are skipped. du keeps counting clones in full, so
+# the tool reports what it shared instead.
+clone_worktree_files="$(dirname "${BASH_SOURCE[0]}")/clone-worktree-files.py"
+if [[ "$(uname -s)" == Darwin && -f "$clone_worktree_files" ]] && command -v python3 >/dev/null 2>&1; then
+  while IFS= read -r repo; do
+    [[ -n "$repo" && -d "$repo/.git" ]] || continue
+    [[ $(git -C "$repo" worktree list --porcelain 2>/dev/null | grep -c '^worktree ') -gt 1 ]] || continue
+    tag=""
+    [[ $primary_count -gt 1 ]] && tag=" ($(basename "$repo"))"
+    clone_args=(--all --kib --source "$repo")
+    $dry_run && clone_args+=(--dry-run)
+    clone_out=$(mktemp)
+    python3 "$clone_worktree_files" "${clone_args[@]}" >"$clone_out" 2>/dev/null </dev/null &
+    clone_pid=$!
+    spin "$clone_pid" "share worktree files with main checkout$tag"
+    wait "$clone_pid" || true
+    shared_kb=$(tr -cd '0-9' <"$clone_out")
+    rm -f "$clone_out"
+    shared_kb=${shared_kb:-0}
+    if [[ $shared_kb -gt 0 ]]; then
+      if $dry_run; then
+        echo -e "  ${BLUE}○${RESET} share worktree files with main checkout$tag ${YELLOW}$(format_size "$shared_kb")${RESET}"
+      else
+        echo -e "  ${GREEN}✓${RESET} shared worktree files with main checkout$tag ${GREEN}$(format_size "$shared_kb")${RESET} freed"
+        ((items_deleted++))
+      fi
+      freed_total=$((freed_total + shared_kb))
+    else
+      echo -e "  ${DIM}· share worktree files$tag (nothing new to share)${RESET}"
+    fi
+  done <<<"$PRIMARY_WORKTREES"
+fi
 
 # ═══════════════════════════════════════════════════════════════════
 echo ""

@@ -36,6 +36,7 @@ Standalone tools you run directly.
 | [`sparse-branch.sh`](scripts/sparse-branch.sh) | Create sparse-checkout worktrees. `--sparse`, `--min`, `--full`; `--min` on an existing branch checks out only the directories the branch changes. Multiple names in parallel, `--base`, `--prefix`. |
 | [`extract.sh`](scripts/extract.sh) | Extract commits or files to a new branch and create a PR in one shot. |
 | [`make-pr.sh`](scripts/make-pr.sh) | Create or update a draft PR from the current branch. |
+| [`clone-worktree-files.py`](scripts/clone-worktree-files.py) | macOS APFS: make linked git worktrees share disk blocks with the main checkout by replacing matching tracked files with copy-on-write clones. `--all` for every linked worktree; `--dry-run` reports what it would share. |
 
 ### [`distill/`](distill/)
 
