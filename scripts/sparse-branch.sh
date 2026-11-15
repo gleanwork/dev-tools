@@ -24,6 +24,7 @@
 
 set -e
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SPARSE_SUPPORT_DIRS="${SPARSE_SUPPORT_DIRS:-.github}"
 
 full=false
@@ -543,6 +544,17 @@ SPARSE_PATTERNS
         fi
       fi
     done
+
+    # On macOS APFS, make the new worktree's files clones of the main
+    # checkout's so they share disk blocks (see clone-worktree-files.py). Runs
+    # in the background so the worktree is ready now; each replacement is an
+    # atomic swap that is undone if the file changed meanwhile.
+    if [[ "$existing_wt" != "true" && "$(uname -s)" == Darwin && -f "$SCRIPT_DIR/clone-worktree-files.py" ]] \
+      && command -v python3 >/dev/null 2>&1; then
+      echo "$tag 🧬 Sharing files with the main checkout in the background (log: $git_dir/clone-worktree-files.log)"
+      nohup nice -n 10 python3 -u "$SCRIPT_DIR/clone-worktree-files.py" --fresh "$PWD" \
+        >"$git_dir/clone-worktree-files.log" 2>&1 </dev/null &
+    fi
 
     local file_count size mode
     file_count=$(git ls-files | wc -l | tr -d ' ')

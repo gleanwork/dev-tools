@@ -8,7 +8,7 @@ so a re-sync is mechanical and nothing project-specific leaks.
 
 | Here | Status |
 |------|--------|
-| `scripts/` (all five) | active upstream; synced from its default branch |
+| `scripts/` (all six) | active upstream; synced from its default branch |
 | `skills/pr/` | active upstream; synced from its HEAD |
 | `commands/` | upstream removed 2026-09 (superseded by the skill); this repo is the only home |
 | `distill/` | this repo is the only home |
